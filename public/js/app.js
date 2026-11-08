@@ -1,33 +1,71 @@
-// The page: a request builder at "/" and the result page at "/result".
+// The page: a request builder at "/", the provider's redirect target at "/callback",
+// and the result at "/result". Everything the flow needs lives in this browser tab;
+// the backend is a stateless helper for discovery, the code exchange and UserInfo.
 import { h, append, clear, icon, formatTime, formatIso, pretty, copyButton, truncateMiddle } from './ui.js';
 import { api } from './api.js';
 import {
-  SCOPES, CLAIM_GROUPS, ACR_PRESETS, DEFAULT_SELECTION, TOKEN_CLAIMS,
-  buildStartRequest, buildScopeList, buildClaimsParameter, requestedClaimKeys, claimLabel, shortClaimName,
+  SCOPES, CLAIM_GROUPS, ACR_PRESETS, DEFAULT_SELECTION, TOKEN_CLAIMS, ISSUER_PRESETS, CLIENT_AUTH_METHODS,
+  buildStartRequest, buildAuthorizationParams, requestedClaimKeys, claimLabel, shortClaimName,
 } from './catalog.js';
 
-const STORAGE_KEY = 'oidc-playground.selection.v1';
+const FORM_KEY = 'oidc-playground.form.v2'; // localStorage: everything that is not a secret
+const SECRETS_KEY = 'oidc-playground.secrets.v2'; // sessionStorage: client secret, private key (this tab only)
+const PENDING_KEY = 'oidc-playground.pending.v2'; // sessionStorage: what we must remember across the redirect
+const RESULT_KEY = 'oidc-playground.result.v2'; // sessionStorage: the last result, so a reload keeps it
 const STEPS = ['Build request', 'Authorize', 'Tokens & claims', 'UserInfo'];
 
 const state = {
-  config: null,
-  configError: null,
-  selection: loadSelection(),
-  result: null,
-  resultError: null,
-  loadingResult: false,
+  form: loadJson(localStorage, FORM_KEY, structuredClone(DEFAULT_SELECTION)),
+  secrets: loadJson(sessionStorage, SECRETS_KEY, { clientSecret: '', privateKey: '' }),
+  discovery: null, // { issuer, provider } | { issuer, error }
+  discovering: false,
+  keyInfo: null, // { key } | { error }
+  showSecret: false,
   starting: false,
+  startError: null,
+  result: loadJson(sessionStorage, RESULT_KEY, null),
+  exchanging: false,
   userinfoBusy: false,
+  userinfoError: null,
   tab: 'claims',
   userinfoTab: 'plain',
 };
 
 const root = document.getElementById('app');
+const redirectUri = `${location.origin}/callback`;
 
-// --- boot & routing ----------------------------------------------------------
+// --- storage ------------------------------------------------------------------------
+
+function loadJson(storage, key, fallback) {
+  try {
+    const saved = JSON.parse(storage.getItem(key) || 'null');
+    if (saved && typeof saved === 'object') return Array.isArray(fallback) ? saved : { ...fallback, ...saved };
+  } catch {
+    /* corrupt or unavailable storage */
+  }
+  return fallback;
+}
+
+function saveJson(storage, key, value) {
+  try {
+    if (value === null || value === undefined) storage.removeItem(key);
+    else storage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage may be unavailable; the page still works for this view */
+  }
+}
+
+const saveForm = () => saveJson(localStorage, FORM_KEY, state.form);
+const saveSecrets = () => saveJson(sessionStorage, SECRETS_KEY, state.secrets);
+const saveResult = () => saveJson(sessionStorage, RESULT_KEY, state.result);
+
+// --- boot & routing -------------------------------------------------------------------
 
 function route() {
-  return location.pathname.replace(/\/+$/, '') === '/result' ? 'result' : 'build';
+  const p = location.pathname.replace(/\/+$/, '');
+  if (p === '/callback') return 'callback';
+  if (p === '/result') return 'result';
+  return 'build';
 }
 
 function navigate(path) {
@@ -36,80 +74,59 @@ function navigate(path) {
 }
 
 async function onRoute() {
-  if (route() === 'result') {
-    state.loadingResult = true;
-    render();
-    await loadResult();
-  }
+  if (route() === 'callback') return handleCallback();
   render();
-}
-
-async function loadResult() {
-  state.resultError = null;
-  try {
-    state.result = await api.result();
-  } catch (err) {
-    state.resultError = err;
-  } finally {
-    state.loadingResult = false;
-  }
-}
-
-async function loadConfig() {
-  state.configError = null;
-  try {
-    state.config = await api.config();
-    if (state.selection.serviceCode === undefined) {
-      state.selection.serviceCode = state.config.provider.serviceCode || '';
-    }
-  } catch (err) {
-    state.configError = err;
-  }
 }
 
 async function boot() {
   render();
-  await loadConfig();
-  await onRoute();
+  if (route() === 'callback') {
+    await handleCallback();
+  } else if (state.form.issuer) {
+    await loadDiscovery();
+  }
 }
 
 window.addEventListener('popstate', onRoute);
 boot();
 
-// --- selection persistence -------------------------------------------------------
+// --- discovery & key inspection ---------------------------------------------------------
 
-function loadSelection() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-    if (saved && typeof saved === 'object') return { ...structuredClone(DEFAULT_SELECTION), ...saved };
-  } catch {
-    /* ignore corrupt storage */
+async function loadDiscovery() {
+  const issuer = state.form.issuer.trim();
+  if (!issuer) {
+    state.discovery = null;
+    return render();
   }
-  return structuredClone(DEFAULT_SELECTION);
+  state.discovering = true;
+  render();
+  const res = await api.discover(issuer);
+  state.discovering = false;
+  state.discovery = res.ok ? { issuer, provider: res.provider } : { issuer, error: res.error };
+  render();
 }
 
-function saveSelection() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.selection));
-  } catch {
-    /* storage may be unavailable; the page still works */
+function discoveryFor(issuer) {
+  return state.discovery && state.discovery.issuer === issuer.trim() && state.discovery.provider ? state.discovery.provider : null;
+}
+
+async function inspectKey() {
+  if (!state.secrets.privateKey.trim()) {
+    state.keyInfo = null;
+    return render();
   }
+  const res = await api.inspectKey(state.secrets.privateKey);
+  state.keyInfo = res.ok ? { key: res.key } : { error: res.error };
+  render();
 }
 
-function update(mutator, { rerender = true } = {}) {
-  mutator(state.selection);
-  saveSelection();
-  if (rerender) render();
-  else renderPreviewOnly();
-}
-
-// --- rendering ------------------------------------------------------------------
+// --- rendering ------------------------------------------------------------------------
 
 function render() {
   const focused = document.activeElement?.id;
   const scrollY = window.scrollY;
   clear(root);
-  const view = route() === 'result' ? resultView() : buildView();
+  const view = route() === 'build' ? buildView() : resultView();
   append(root, [topbar(), view]);
   if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
   window.scrollTo(0, scrollY);
@@ -122,8 +139,25 @@ function renderPreviewOnly() {
   append(slot, previewPanel());
 }
 
+function updateForm(mutator, { rerender = true } = {}) {
+  mutator(state.form);
+  saveForm();
+  if (rerender) render();
+  else renderPreviewOnly();
+}
+
+function providerLabel() {
+  const issuer = state.form.issuer.trim();
+  const preset = ISSUER_PRESETS.find((p) => p.issuer === issuer);
+  if (preset) return preset.label.replace(' (npm run mock-op)', '');
+  try {
+    return issuer ? new URL(issuer).host : 'no provider yet';
+  } catch {
+    return 'no provider yet';
+  }
+}
+
 function topbar() {
-  const label = state.config?.provider?.label || 'OpenID Connect';
   return h('header.topbar', {},
     h('div.topbar-inner', {},
       h('a.brand', { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } },
@@ -131,26 +165,26 @@ function topbar() {
         h('span.brand-name', 'OIDC Playground'),
       ),
       h('div.topbar-actions', {},
-        h('span.pill.pill-accent', {}, h('span.dot'), label),
-        h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: resetEverything }, icon('reset', 14, { strokeWidth: 2 }), ' Reset'),
+        h('span.pill.pill-accent', {}, h('span.dot'), providerLabel()),
+        h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: resetEverything, title: 'Forget the result, the secrets in this tab and the form' }, icon('reset', 14, { strokeWidth: 2 }), ' Reset'),
       ),
     ),
   );
 }
 
-async function resetEverything() {
-  try {
-    await api.reset();
-  } catch {
-    /* session may already be gone */
-  }
-  state.selection = structuredClone(DEFAULT_SELECTION);
-  state.selection.serviceCode = state.config?.provider?.serviceCode || '';
-  saveSelection();
+function resetEverything() {
+  state.form = structuredClone(DEFAULT_SELECTION);
+  state.secrets = { clientSecret: '', privateKey: '' };
   state.result = null;
-  state.tab = 'claims';
-  state.userinfoTab = 'plain';
+  state.keyInfo = null;
+  state.discovery = null;
+  state.startError = null;
+  saveForm();
+  saveSecrets();
+  saveResult();
+  saveJson(sessionStorage, PENDING_KEY, null);
   navigate('/');
+  loadDiscovery();
 }
 
 function stepper(current) {
@@ -193,22 +227,38 @@ function kvRows(rows, { keyWidth = 'minmax(110px, 160px)' } = {}) {
   );
 }
 
-// --- build view ------------------------------------------------------------------
+function field(label, input, { full = false, hint = null } = {}) {
+  return h(`div.field${full ? '.field-full' : ''}`, {}, h('label.field-label', { for: input.id }, label), input, hint ? h('p.field-hint', {}, hint) : null);
+}
+
+function errorBanner(error, extra = null) {
+  return h('div.banner.banner-err', { role: 'alert' },
+    icon('alert', 18),
+    h('div', {},
+      h('div', {}, h('strong', `${error.error || 'error'}`), error.stage ? h('span.muted', ` · during ${error.stage}`) : null),
+      h('div', error.error_description || ''),
+      error.errors?.length ? h('ul.plain-list', {}, error.errors.map((e) => h('li', e))) : null,
+      extra,
+    ),
+  );
+}
+
+// --- build view -------------------------------------------------------------------------
 
 function buildView() {
-  const sel = state.selection;
+  const f = state.form;
   return h('main.main', {},
     stepper(1),
     h('div.page-head', {},
       h('h1.page-title', 'Build the authentication request'),
-      h('p.page-lead', 'Pick scopes and individual claims. The request on the right updates live; press Authorize to send it to the provider.'),
+      h('p.page-lead', 'Fill in the provider and your client, pick scopes and claims, press Authorize. Nothing is stored on the server — secrets stay in this browser tab.'),
     ),
     h('div.columns', {},
       h('section.col-main', {},
         providerCard(),
-        scopesCard(sel),
-        claimsCard(sel),
-        optionsCard(sel),
+        scopesCard(f),
+        claimsCard(f),
+        optionsCard(f),
       ),
       h('aside.col-side#preview-slot', {}, previewPanel()),
     ),
@@ -216,81 +266,140 @@ function buildView() {
 }
 
 function providerCard() {
-  const cfg = state.config;
-  const sel = state.selection;
-  const discovery = cfg?.discovery;
-  let status;
-  if (state.configError) {
-    status = h('span.pill.pill-err', {}, icon('alert', 14), ' Backend unreachable');
-  } else if (!cfg) {
-    status = h('span.pill', 'Loading…');
-  } else if (discovery?.ok) {
-    status = h('span.pill.pill-ok', {}, icon('check', 14, { strokeWidth: 3 }), ' Discovery loaded');
-  } else {
-    status = h('span.pill.pill-err', {}, icon('alert', 14), ' Discovery failed');
-  }
+  const f = state.form;
+  const s = state.secrets;
+  const provider = discoveryFor(f.issuer);
 
-  const fields = cfg
-    ? [
-        field('Issuer', h('input.input.mono', { id: 'f-issuer', type: 'text', value: cfg.provider.issuer, readonly: true, 'aria-describedby': 'issuer-hint' }), 'full', h('span.field-hint#issuer-hint', 'Set in .env (ISSUER)')),
-        field('Client ID', h('input.input.mono', { id: 'f-client', type: 'text', value: cfg.provider.clientId, readonly: true })),
-        field('Redirect URI', h('input.input.mono', { id: 'f-redirect', type: 'text', value: cfg.provider.redirectUri, readonly: true })),
-        field('Service code (itsme®)', h('input.input.mono', {
-          id: 'f-service', type: 'text', value: sel.serviceCode ?? '', placeholder: 'e.g. MYSERVICE_LOGIN', autocomplete: 'off', spellcheck: 'false',
-          oninput: (e) => update((s) => { s.serviceCode = e.target.value.trim(); }, { rerender: false }),
-        })),
-        field('Client authentication', h('input.input.mono', { id: 'f-auth', type: 'text', value: cfg.provider.clientAuth + (cfg.provider.jwksUrl ? ' · keys at /.well-known/jwks.json' : ''), readonly: true })),
-      ]
-    : [];
+  let status;
+  if (state.discovering) status = h('span.pill', {}, h('span.spinner.spinner-xs'), ' Loading discovery…');
+  else if (provider) status = h('span.pill.pill-ok', {}, icon('check', 14, { strokeWidth: 3 }), ' Discovery loaded');
+  else if (state.discovery?.error && state.discovery.issuer === f.issuer.trim()) status = h('span.pill.pill-err', {}, icon('alert', 14), ' Discovery failed');
+  else status = h('span.pill', 'Discovery not loaded');
+
+  const presetSelect = h('select.input#f-preset', {
+    'aria-label': 'Issuer presets',
+    onchange: (e) => {
+      const preset = ISSUER_PRESETS.find((p) => p.id === e.target.value);
+      if (preset) updateForm((st) => { st.issuer = preset.issuer; });
+      loadDiscovery();
+    },
+  },
+    h('option', { value: '', selected: !ISSUER_PRESETS.some((p) => p.issuer === f.issuer) }, 'custom issuer…'),
+    ISSUER_PRESETS.map((p) => h('option', { value: p.id, selected: p.issuer === f.issuer }, p.label)),
+  );
+
+  const issuerInput = h('input.input.mono#f-issuer', {
+    type: 'url', value: f.issuer, placeholder: 'https://idp.e2e.itsme.services/v2', autocomplete: 'off', spellcheck: 'false',
+    oninput: (e) => updateForm((st) => { st.issuer = e.target.value; }, { rerender: false }),
+    onchange: () => loadDiscovery(),
+    onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); loadDiscovery(); } },
+  });
+
+  const authSelect = h('select.input#f-auth', {
+    onchange: (e) => updateForm((st) => { st.clientAuthMethod = e.target.value; }),
+  }, CLIENT_AUTH_METHODS.map((m) => h('option', { value: m.id, selected: m.id === f.clientAuthMethod }, m.label)));
+
+  const needsSecret = f.clientAuthMethod.startsWith('client_secret');
+  const needsKey = f.clientAuthMethod === 'private_key_jwt';
+
+  const secretField = needsSecret
+    ? field('Client secret', h('div.input-row', {},
+        h('input.input.mono#f-secret', {
+          type: state.showSecret ? 'text' : 'password', value: s.clientSecret, autocomplete: 'off', spellcheck: 'false', placeholder: 'kept in this tab only',
+          oninput: (e) => { state.secrets.clientSecret = e.target.value; saveSecrets(); },
+        }),
+        h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: () => { state.showSecret = !state.showSecret; render(); }, 'aria-pressed': String(state.showSecret) }, state.showSecret ? 'Hide' : 'Show'),
+      ), { hint: 'Stored in sessionStorage — gone when you close the tab.' })
+    : null;
+
+  const keyField = field(needsKey ? 'Private key (JWK or PEM)' : 'Private key (JWK or PEM) — optional, to decrypt encrypted responses',
+    h('textarea.input.mono.textarea#f-key', {
+      rows: 5, spellcheck: 'false', placeholder: needsKey ? '{"kty":"RSA","kid":"…","d":"…", …}  or  -----BEGIN PRIVATE KEY-----' : 'only needed when the provider encrypts the ID token / UserInfo for your client',
+      oninput: (e) => { state.secrets.privateKey = e.target.value; saveSecrets(); },
+      onchange: () => inspectKey(),
+    }, s.privateKey),
+    { full: true, hint: ['Signs the client assertion and decrypts JWE responses. The matching ', h('strong', 'public'), ' key must be in the JWKS you host on your public link (the jwks_uri registered at the provider) — never paste the private key anywhere else.'] });
+
+  let keyInfo = null;
+  if (state.keyInfo?.key) {
+    const k = state.keyInfo.key;
+    keyInfo = h('div.note.note-ok', {},
+      h('div.row-between', {},
+        h('span', {}, icon('check', 14, { strokeWidth: 3 }), ` Key loaded · ${k.kty} · ${k.alg} · kid `, h('code', k.kid)),
+        copyButton('Copy public JWK', () => pretty(k.public_jwk), 'btn-xs'),
+      ),
+      h('p.field-hint', {}, 'Your hosted JWKS must contain this public key with the same kid.'),
+    );
+  } else if (state.keyInfo?.error) {
+    keyInfo = h('div.note.note-err', {}, icon('alert', 14), ` ${state.keyInfo.error.error_description}`);
+  }
 
   let endpoints = null;
-  if (discovery?.ok) {
-    endpoints = h('div.endpoints', {},
-      Object.entries(discovery.endpoints).map(([k, v]) =>
-        h('div.endpoint', {}, h('span.endpoint-key', k), h('span.endpoint-val.mono', { title: v }, v || '—')),
+  if (provider) {
+    const chips = [];
+    if (provider.claims_parameter_supported) chips.push('claims parameter');
+    if (provider.code_challenge_methods_supported?.includes('S256')) chips.push('PKCE S256');
+    if (provider.token_endpoint_auth_methods_supported?.length) chips.push(`auth: ${provider.token_endpoint_auth_methods_supported.join(', ')}`);
+    if (provider.id_token_encryption_alg_values_supported?.length) chips.push('encrypted ID tokens');
+    endpoints = h('div.stack-sm', {},
+      h('div.endpoints', {},
+        Object.entries(provider.endpoints).filter(([, v]) => v).map(([k, v]) =>
+          h('div.endpoint', {}, h('span.endpoint-key', k), h('span.endpoint-val.mono', { title: v }, v)),
+        ),
       ),
+      chips.length ? h('div.chips.chips-sm', {}, chips.map((c) => h('span.tag', c))) : null,
     );
-  } else if (discovery && !discovery.ok) {
-    endpoints = h('div.banner.banner-err', {},
-      icon('alert', 18),
-      h('div', {},
-        h('strong', `${discovery.error.error}: `), discovery.error.error_description,
-        h('div.banner-actions', {}, h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: async () => { await loadConfig(); render(); } }, 'Retry discovery')),
-      ),
-    );
-  } else if (state.configError) {
-    endpoints = h('div.banner.banner-err', {}, icon('alert', 18), h('div', {}, h('strong', 'Cannot reach the backend. '), 'Is the server running? ', h('code', state.configError.message)));
+  } else if (state.discovery?.error && state.discovery.issuer === f.issuer.trim()) {
+    endpoints = errorBanner(state.discovery.error, h('div.banner-actions', {}, h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: loadDiscovery }, 'Retry')));
   }
 
-  return card('Provider & client', ['Endpoints are read from the discovery document at ', h('code', '/.well-known/openid-configuration'), '.'],
-    [h('div.fields', {}, fields), endpoints],
+  return card('Provider & client', ['Endpoints are read from the discovery document at ', h('code', '<issuer>/.well-known/openid-configuration'), '. The client details are used only for this flow.'],
+    [
+      h('div.fields', {},
+        field('Issuer', h('div.input-row', {}, issuerInput, h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: loadDiscovery }, 'Load')), { full: true }),
+        field('Preset', presetSelect),
+        field('Client ID', h('input.input.mono#f-client', {
+          type: 'text', value: f.clientId, placeholder: 'the client_id the provider gave you', autocomplete: 'off', spellcheck: 'false',
+          oninput: (e) => updateForm((st) => { st.clientId = e.target.value.trim(); }, { rerender: false }),
+        })),
+        field('Client authentication', authSelect),
+        secretField,
+        field('Service code (itsme®)', h('input.input.mono#f-service', {
+          type: 'text', value: f.serviceCode ?? '', placeholder: 'becomes the service:<code> scope', autocomplete: 'off', spellcheck: 'false',
+          oninput: (e) => {
+            updateForm((st) => { st.serviceCode = e.target.value.trim(); }, { rerender: false });
+            const chip = document.querySelector('[data-scope="service"] .chip-label');
+            if (chip) chip.textContent = `service:${state.form.serviceCode || 'SERVICE_CODE'}`;
+          },
+        })),
+        field('Redirect URI', h('div.input-row', {}, h('input.input.mono#f-redirect', { type: 'text', value: redirectUri, readonly: true }), copyButton('Copy', redirectUri, 'btn-sm')), { hint: 'Register this exact URI at the provider.' }),
+        keyField,
+        keyInfo,
+      ),
+      endpoints,
+    ],
     { id: 'h-provider', right: status });
 }
 
-function field(label, input, span, hint) {
-  const id = input.id;
-  return h(`div.field${span === 'full' ? '.field-full' : ''}`, {}, h('label.field-label', { for: id }, label), input, hint || null);
-}
-
-function scopesCard(sel) {
+function scopesCard(f) {
   const chips = SCOPES.map((s) => {
-    const on = s.locked || !!sel.scopes[s.id];
-    const label = s.dynamic ? `service:${sel.serviceCode || 'SERVICE_CODE'}` : s.id;
+    const on = s.locked || !!f.scopes[s.id];
+    const label = s.dynamic ? `service:${f.serviceCode || 'SERVICE_CODE'}` : s.id;
     return h('button.chip', {
-      type: 'button', 'aria-pressed': String(on), disabled: s.locked, title: s.hint,
-      onclick: () => update((st) => { st.scopes[s.id] = !st.scopes[s.id]; }),
-    }, s.locked ? icon('lock', 14) : on ? icon('check', 14, { strokeWidth: 3 }) : null, label);
+      type: 'button', 'aria-pressed': String(on), disabled: s.locked, title: s.hint, dataset: { scope: s.id },
+      onclick: () => updateForm((st) => { st.scopes[s.id] = !st.scopes[s.id]; }),
+    }, s.locked ? icon('lock', 14) : on ? icon('check', 14, { strokeWidth: 3 }) : null, h('span.chip-label', label));
   });
   return card('Scopes', ['Each scope requests a bundle of claims. ', h('code', 'openid'), ' is required for an ID token.'],
     h('div.chips', {}, chips), { id: 'h-scopes' });
 }
 
-function claimsCard(sel) {
-  const selectedCount = Object.values(sel.claims).filter(Boolean).length;
+function claimsCard(f) {
+  const selectedCount = Object.values(f.claims).filter(Boolean).length;
   const targets = [['userinfo', 'UserInfo'], ['id_token', 'ID token'], ['both', 'Both']];
   const seg = h('div.seg', { role: 'group', 'aria-label': 'Deliver claims in' },
     targets.map(([id, label]) =>
-      h('button.seg-btn', { type: 'button', 'aria-pressed': String(sel.target === id), onclick: () => update((st) => { st.target = id; }) }, label),
+      h('button.seg-btn', { type: 'button', 'aria-pressed': String(f.target === id), onclick: () => updateForm((st) => { st.target = id; }) }, label),
     ),
   );
   const right = h('div.card-tools', {}, h('span.muted.nowrap', `${selectedCount} selected`), seg);
@@ -298,7 +407,7 @@ function claimsCard(sel) {
   const groups = CLAIM_GROUPS.map((group) =>
     h('div.claim-group', {},
       h('div.claim-group-head', {}, h('h3.claim-group-title', group.title), h('span.claim-group-hint.mono', group.hint)),
-      h('div.claim-grid', {}, group.claims.map((c) => claimRow(c, sel))),
+      h('div.claim-grid', {}, group.claims.map((c) => claimRow(c, f))),
       group.id === 'itsme' ? h('p.field-hint', {}, 'BENationalNumber and BEeidSn are also released by the ', h('code', 'eid'), ' scope.') : null,
     ),
   );
@@ -307,40 +416,42 @@ function claimsCard(sel) {
     groups, { id: 'h-claims', right });
 }
 
-function claimRow(c, sel) {
-  const on = !!sel.claims[c.id];
-  const essential = on && !!sel.essential[c.id];
+function claimRow(c, f) {
+  const on = !!f.claims[c.id];
+  const essential = on && !!f.essential[c.id];
   const inputId = `claim-${c.id}`;
   return h(`div.claim${on ? '.is-on' : ''}`, {},
-    h('input', { type: 'checkbox', id: inputId, checked: on, onchange: () => update((st) => { st.claims[c.id] = !st.claims[c.id]; }) }),
+    h('input', { type: 'checkbox', id: inputId, checked: on, onchange: () => updateForm((st) => { st.claims[c.id] = !st.claims[c.id]; }) }),
     h('label.claim-label.mono', { for: inputId, title: c.title }, c.label),
     h('button.ess', {
       type: 'button', 'aria-pressed': String(essential), disabled: !on,
       'aria-label': `${essential ? 'Unmark' : 'Mark'} ${c.label} as essential`,
-      onclick: () => update((st) => { st.essential[c.id] = !st.essential[c.id]; }),
+      onclick: () => updateForm((st) => { st.essential[c.id] = !st.essential[c.id]; }),
     }, 'essential'),
   );
 }
 
-function optionsCard(sel) {
+function optionsCard(f) {
   const select = (id, value, options, onchange) =>
     h('select.input', { id, onchange }, options.map((o) => h('option', { value: o.value, selected: o.value === value }, o.label)));
   const acrOptions = [...ACR_PRESETS];
-  if (sel.acr && !acrOptions.some((o) => o.value === sel.acr)) acrOptions.push({ value: sel.acr, label: sel.acr });
+  const supported = discoveryFor(f.issuer)?.acr_values_supported || [];
+  for (const v of supported) if (!acrOptions.some((o) => o.value === v)) acrOptions.push({ value: v, label: v });
+  if (f.acr && !acrOptions.some((o) => o.value === f.acr)) acrOptions.push({ value: f.acr, label: f.acr });
 
   return card('Request options', ['Optional parameters from OpenID Connect Core §3.1.2.1. Empty fields are left out of the request.'],
     h('div.fields.fields-3', {},
-      field('acr_values', select('f-acr', sel.acr, acrOptions, (e) => update((st) => { st.acr = e.target.value; }))),
-      field('prompt', select('f-prompt', sel.prompt, [
+      field('acr_values', select('f-acr', f.acr, acrOptions, (e) => updateForm((st) => { st.acr = e.target.value; }))),
+      field('prompt', select('f-prompt', f.prompt, [
         { value: '', label: 'not set' }, { value: 'none', label: 'none' }, { value: 'login', label: 'login' }, { value: 'consent', label: 'consent' }, { value: 'select_account', label: 'select_account' },
-      ], (e) => update((st) => { st.prompt = e.target.value; }))),
-      field('ui_locales', select('f-locales', sel.uiLocales, [
+      ], (e) => updateForm((st) => { st.prompt = e.target.value; }))),
+      field('ui_locales', select('f-locales', f.uiLocales, [
         { value: '', label: 'not set' }, { value: 'nl', label: 'nl' }, { value: 'fr', label: 'fr' }, { value: 'de', label: 'de' }, { value: 'en', label: 'en' },
-      ], (e) => update((st) => { st.uiLocales = e.target.value; }))),
-      field('max_age (seconds)', h('input.input.mono', { id: 'f-maxage', type: 'number', min: 0, value: sel.maxAge, placeholder: 'e.g. 300', oninput: (e) => update((st) => { st.maxAge = e.target.value; }, { rerender: false }) })),
-      field('login_hint', h('input.input.mono', { id: 'f-hint', type: 'text', value: sel.loginHint, placeholder: 'phone number or e-mail', autocomplete: 'off', oninput: (e) => update((st) => { st.loginHint = e.target.value; }, { rerender: false }) })),
+      ], (e) => updateForm((st) => { st.uiLocales = e.target.value; }))),
+      field('max_age (seconds)', h('input.input.mono#f-maxage', { type: 'number', min: 0, value: f.maxAge, placeholder: 'e.g. 300', oninput: (e) => updateForm((st) => { st.maxAge = e.target.value; }, { rerender: false }) })),
+      field('login_hint', h('input.input.mono#f-hint', { type: 'text', value: f.loginHint, placeholder: 'phone number or e-mail', autocomplete: 'off', oninput: (e) => updateForm((st) => { st.loginHint = e.target.value; }, { rerender: false }) })),
       h('div.field.field-check', {},
-        h('input', { type: 'checkbox', id: 'f-pkce', checked: sel.pkce, onchange: () => update((st) => { st.pkce = !st.pkce; }) }),
+        h('input', { type: 'checkbox', id: 'f-pkce', checked: f.pkce, onchange: () => updateForm((st) => { st.pkce = !st.pkce; }) }),
         h('label.field-label', { for: 'f-pkce' }, 'PKCE ', h('span.muted', '(S256 code challenge)')),
       ),
     ),
@@ -348,34 +459,28 @@ function optionsCard(sel) {
 }
 
 function previewPanel() {
-  const sel = state.selection;
-  const cfg = state.config;
-  const body = buildStartRequest(sel, sel.serviceCode);
-  const claimsParam = body.claims;
-  const endpoint = cfg?.discovery?.ok ? cfg.discovery.endpoints.authorization_endpoint : (cfg ? `${cfg.provider.issuer}/… (from discovery)` : '…');
+  const f = state.form;
+  const provider = discoveryFor(f.issuer);
+  const body = buildStartRequest(f, f.serviceCode);
+  const endpoint = provider ? provider.endpoints.authorization_endpoint : `${f.issuer.trim() || '<issuer>'}/… (load discovery)`;
+  const params = buildAuthorizationParams(body, {
+    clientId: f.clientId || '<client_id>',
+    redirectUri,
+    state: '{generated on Authorize}',
+    nonce: '{generated on Authorize}',
+    codeChallenge: '{S256 of a fresh verifier}',
+  }).map(([k, v]) => {
+    if (k === 'claims') {
+      const n = requestedClaimKeys(body.claims).length;
+      return { k, v: `{ ${Object.keys(body.claims).map((t) => `"${t}": { … ${n} }`).join(', ')} }  — see below` };
+    }
+    return { k, v };
+  });
 
-  const params = [
-    { k: 'response_type', v: 'code' },
-    { k: 'client_id', v: cfg?.provider.clientId || '…' },
-    { k: 'redirect_uri', v: cfg?.provider.redirectUri || '…' },
-    { k: 'scope', v: body.scopes.join(' ') },
-    { k: 'state', v: '{generated on Authorize}' },
-    { k: 'nonce', v: '{generated on Authorize}' },
-  ];
-  if (body.pkce) params.push({ k: 'code_challenge', v: '{S256 of a fresh verifier}' }, { k: 'code_challenge_method', v: 'S256' });
-  for (const k of ['acr_values', 'prompt', 'ui_locales', 'max_age', 'login_hint']) {
-    if (body[k] !== undefined) params.push({ k, v: String(body[k]) });
-  }
-  if (claimsParam) {
-    const n = requestedClaimKeys(claimsParam).length;
-    params.push({ k: 'claims', v: `{ ${Object.keys(claimsParam).map((t) => `"${t}": { … ${n} }`).join(', ')} }  — see below` });
-  }
-
-  const canStart = !!cfg?.discovery?.ok && !state.starting;
+  const problems = readinessProblems();
   const previewUrl = () => {
-    const u = new URL(cfg?.discovery?.ok ? endpoint : 'https://provider.example/authorize');
-    for (const p of params) if (p.k !== 'claims') u.searchParams.set(p.k, p.v);
-    if (claimsParam) u.searchParams.set('claims', JSON.stringify(claimsParam));
+    const u = new URL(provider ? endpoint : 'https://provider.example/authorize');
+    for (const [k, v] of buildAuthorizationParams(body, { clientId: f.clientId || '<client_id>', redirectUri, state: '{state}', nonce: '{nonce}', codeChallenge: '{code_challenge}' })) u.searchParams.set(k, v);
     return u.href;
   };
 
@@ -385,54 +490,183 @@ function previewPanel() {
       kvRows(params, { keyWidth: 'minmax(120px, 180px)' }),
     ], { id: 'h-preview', right: h('span.tag.tag-ok.mono', 'GET') }),
     card('claims parameter', ['Sent URL-encoded as ', h('code', 'claims='), '. ', h('code', 'null'), ' means voluntary.'],
-      h('pre.code', claimsParam ? pretty(claimsParam) : '{ }  // no individual claims selected'),
+      h('pre.code', body.claims ? pretty(body.claims) : '{ }  // no individual claims selected'),
       { id: 'h-claimsjson' }),
     h('div.cta', {},
-      h('button.btn.btn-primary.btn-lg', { type: 'button', disabled: !canStart, onclick: startAuthorization },
-        state.starting ? 'Preparing request…' : `Authorize with ${providerShortName()}`, icon('arrow', 18)),
+      h('button.btn.btn-primary.btn-lg', { type: 'button', disabled: problems.length > 0 || state.starting, onclick: startAuthorization },
+        state.starting ? 'Redirecting…' : `Authorize with ${providerLabel().split('·')[0].trim()}`, icon('arrow', 18)),
+      problems.length ? h('ul.plain-list.muted.small', {}, problems.map((p) => h('li', p))) : null,
       copyButton('Copy authorization URL (preview)', previewUrl),
-      state.startError ? h('div.banner.banner-err', {}, icon('alert', 18), h('div', {}, state.startError)) : null,
-      h('p.cta-note', {}, 'You leave for the provider and come back to ', h('code', '/callback'), ' with a one-time code. state, nonce and the PKCE verifier are generated server-side when you click.'),
+      state.startError ? errorBanner(state.startError) : null,
+      h('p.cta-note', {}, 'You leave for the provider and come back to ', h('code', '/callback'), '. state, nonce and the PKCE verifier are generated here in the browser and kept in this tab.'),
     ),
   ];
 }
 
-function providerShortName() {
-  const label = state.config?.provider?.label || 'the provider';
-  return label.split('·')[0].trim();
+function readinessProblems() {
+  const f = state.form;
+  const problems = [];
+  if (!f.issuer.trim()) problems.push('Enter the issuer.');
+  else if (!discoveryFor(f.issuer)) problems.push('Load the discovery document first.');
+  if (!f.clientId.trim()) problems.push('Enter the client ID.');
+  if (f.clientAuthMethod.startsWith('client_secret') && !state.secrets.clientSecret) problems.push('Enter the client secret.');
+  if (f.clientAuthMethod === 'private_key_jwt' && !state.secrets.privateKey.trim()) problems.push('Paste the private key for private_key_jwt.');
+  if (!window.isSecureContext || !crypto.subtle) problems.push('Open the page over https or on localhost (needed to generate PKCE).');
+  return problems;
+}
+
+// --- starting the flow (all in the browser) -------------------------------------------------
+
+function randomUrlSafe(bytes = 32) {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return base64url(buf);
+}
+
+function base64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function pkcePair() {
+  const verifier = randomUrlSafe(32); // 43 characters, RFC 7636
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: base64url(new Uint8Array(digest)) };
 }
 
 async function startAuthorization() {
+  const f = state.form;
+  const provider = discoveryFor(f.issuer);
+  if (!provider) return;
   state.starting = true;
   state.startError = null;
   renderPreviewOnly();
   try {
-    const body = buildStartRequest(state.selection, state.selection.serviceCode);
-    const { url } = await api.start(body);
-    window.location.assign(url);
+    const body = buildStartRequest(f, f.serviceCode);
+    const stateValue = randomUrlSafe(24);
+    const nonce = randomUrlSafe(24);
+    const pkce = body.pkce ? await pkcePair() : null;
+    const params = buildAuthorizationParams(body, { clientId: f.clientId.trim(), redirectUri, state: stateValue, nonce, codeChallenge: pkce?.challenge });
+    const url = new URL(provider.endpoints.authorization_endpoint);
+    for (const [k, v] of params) url.searchParams.set(k, v);
+
+    saveJson(sessionStorage, PENDING_KEY, {
+      startedAt: new Date().toISOString(),
+      issuer: f.issuer.trim(),
+      clientId: f.clientId.trim(),
+      clientAuthMethod: f.clientAuthMethod,
+      state: stateValue,
+      nonce,
+      codeVerifier: pkce?.verifier || null,
+      maxAge: body.max_age ?? null,
+      request: {
+        url: url.href,
+        endpoint: provider.endpoints.authorization_endpoint,
+        params: params.map(([k, v]) => ({ k, v })),
+        scopes: body.scopes,
+        claims: body.claims,
+        redirectUri,
+      },
+      endpoints: provider.endpoints,
+    });
+    state.result = null;
+    saveResult();
+    window.location.assign(url.href);
   } catch (err) {
     state.starting = false;
-    const errors = err.body?.errors;
-    state.startError = errors ? `Request rejected: ${errors.join('; ')}` : err.message;
+    state.startError = { error: 'start_failed', error_description: err.message };
     renderPreviewOnly();
   }
 }
 
-// --- result view ----------------------------------------------------------------
+// --- /callback: finish the flow with the backend ----------------------------------------------
+
+async function handleCallback() {
+  const query = Object.fromEntries(new URLSearchParams(location.search));
+  const callbackUrl = location.href;
+  const pending = loadJson(sessionStorage, PENDING_KEY, null);
+  saveJson(sessionStorage, PENDING_KEY, null);
+  const callback = { url: `${location.pathname}${location.search}`, query, receivedAt: new Date().toISOString() };
+
+  state.exchanging = true;
+  render();
+
+  const finish = (result) => {
+    state.result = result;
+    state.exchanging = false;
+    state.tab = 'claims';
+    state.userinfoTab = 'plain';
+    saveResult();
+    history.replaceState({}, '', '/result');
+    render();
+  };
+
+  if (!pending) {
+    return finish({
+      status: 'error',
+      callback,
+      error: {
+        stage: 'callback',
+        error: 'no_pending_request',
+        error_description: 'This tab has no request waiting for a callback (it was started in another tab, already used, or the tab was closed). Start a new request.',
+      },
+    });
+  }
+  if (query.state && query.state !== pending.state) {
+    return finish({ status: 'error', callback, request: pending.request, config: configSummary(pending), error: { stage: 'callback', error: 'state_mismatch', error_description: `The state in the callback (${query.state}) is not the one this tab sent (${pending.state}).` } });
+  }
+  if (query.error) {
+    return finish({ status: 'error', callback, request: pending.request, config: configSummary(pending), error: { stage: 'authorization', error: query.error, error_description: query.error_description || 'The provider returned an error instead of a code.' } });
+  }
+
+  const secrets = state.secrets;
+  const clientAuth = { method: pending.clientAuthMethod };
+  if (pending.clientAuthMethod.startsWith('client_secret')) clientAuth.client_secret = secrets.clientSecret;
+  if (secrets.privateKey.trim()) clientAuth.private_key = secrets.privateKey;
+
+  const res = await api.token({
+    issuer: pending.issuer,
+    client_id: pending.clientId,
+    client_auth: clientAuth,
+    callback_url: callbackUrl,
+    expected_state: pending.state,
+    expected_nonce: pending.nonce,
+    code_verifier: pending.codeVerifier || undefined,
+    max_age: pending.maxAge ?? undefined,
+  });
+
+  if (!res.ok) {
+    return finish({ status: 'error', callback, request: pending.request, config: configSummary(pending), error: res.error });
+  }
+  finish({
+    status: 'ok',
+    callback,
+    request: pending.request,
+    config: configSummary(pending),
+    endpoints: { ...pending.endpoints, ...(res.endpoints || {}) },
+    tokens: res.tokens,
+    idToken: res.idToken,
+    userinfo: null,
+  });
+}
+
+function configSummary(pending) {
+  return { issuer: pending.issuer, clientId: pending.clientId, clientAuthMethod: pending.clientAuthMethod };
+}
+
+// --- result view -------------------------------------------------------------------------
 
 function resultView() {
   const r = state.result;
-  if (state.loadingResult || (!r && !state.resultError)) {
-    return h('main.main', {}, stepper(3), h('div.card.card-center', {}, h('div.spinner'), h('p.muted', 'Loading the result…')));
+  if (state.exchanging) {
+    return h('main.main', {}, stepper(3), h('div.card.card-center', {}, h('div.spinner'), h('p.muted', 'Exchanging the code for tokens and validating the ID token…')));
   }
-  if (state.resultError) {
-    return h('main.main', {}, stepper(3), h('div.banner.banner-err', {}, icon('alert', 18), h('div', {}, h('strong', 'Could not load the result. '), state.resultError.message)));
-  }
-  if (r.status === 'empty') {
+  if (!r) {
     return h('main.main', {}, stepper(1),
       h('div.card.card-center', {},
         h('h1.page-title', 'Nothing here yet'),
-        h('p.muted', 'This browser session has no completed authorization. Build a request and authorize to see tokens and claims.'),
+        h('p.muted', 'This tab has no completed authorization. Build a request and authorize to see tokens and claims.'),
         h('a.btn.btn-primary', { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } }, 'Build a request', icon('arrow', 18)),
       ),
     );
@@ -451,7 +685,7 @@ function resultView() {
     ),
     h('div.page-head', {},
       h('h1.page-title', 'Tokens & ID token claims'),
-      h('p.page-lead', 'The token endpoint returned an ID token and an access token. Below is everything the ID token says — about the user and about itself.'),
+      h('p.page-lead', `${r.config.issuer} · client ${r.config.clientId} · ${r.config.clientAuthMethod}. Below is everything the ID token says — about the user and about itself.`),
     ),
     h('div.columns', {},
       h('section.col-main', {}, idTokenCard(r), userinfoCard(r)),
@@ -466,27 +700,18 @@ function resultView() {
 
 function errorView(r) {
   const e = r.error || {};
+  const lead = e.stage === 'authorization'
+    ? 'The provider sent back an error instead of an authorization code.'
+    : e.stage === 'callback'
+      ? 'The callback could not be matched to a request from this tab.'
+      : 'The authorization code could not be exchanged, or the ID token failed validation.';
   return h('main.main', {},
     stepper(e.stage === 'authorization' || e.stage === 'callback' ? 2 : 3),
-    h('div.banner.banner-err', { role: 'alert' },
-      icon('alert', 20),
-      h('div', {},
-        h('div', {}, h('strong', `${e.error || 'error'}`), e.stage ? h('span.muted', ` · during ${e.stage}`) : null),
-        h('div', e.error_description || ''),
-        r.callback?.url ? h('code.mono.small.break', r.callback.url) : null,
-      ),
-    ),
-    h('div.page-head', {},
-      h('h1.page-title', 'The flow did not complete'),
-      h('p.page-lead', e.stage === 'authorization'
-        ? 'The provider sent back an error instead of an authorization code.'
-        : e.stage === 'callback'
-          ? 'The callback could not be matched to a request from this browser.'
-          : 'The authorization code could not be exchanged or the ID token failed validation.'),
-    ),
+    errorBanner(e, r.callback?.url ? h('code.mono.small.break', r.callback.url) : null),
+    h('div.page-head', {}, h('h1.page-title', 'The flow did not complete'), h('p.page-lead', lead)),
     h('div.columns', {},
       h('section.col-main', {}, r.request ? requestSentCard(r, { open: true }) : null),
-      h('aside.col-side', {}, r.callback?.query ? card('Callback parameters', null, kvRows(Object.entries(r.callback.query).map(([k, v]) => ({ k, v }))), { id: 'h-cbq' }) : null),
+      h('aside.col-side', {}, r.callback?.query && Object.keys(r.callback.query).length ? card('Callback parameters', null, kvRows(Object.entries(r.callback.query).map(([k, v]) => ({ k, v }))), { id: 'h-cbq' }) : null),
     ),
     h('div.actions', {},
       h('a.btn.btn-primary.btn-lg', { href: '/', onclick: (ev) => { ev.preventDefault(); navigate('/'); } }, icon('reset', 16, { strokeWidth: 2 }), 'Back to the request builder'),
@@ -501,11 +726,11 @@ function tabs(items, current, onPick) {
 }
 
 function idTokenCard(r) {
-  const { header, payload, format, checks } = r.idToken;
+  const { header, format, checks } = r.idToken;
   const allOk = checks.every((c) => c.ok);
   const right = h(`span.pill.${allOk ? 'pill-ok' : 'pill-err'}`, {}, icon(allOk ? 'check' : 'alert', 14, { strokeWidth: 3 }), allOk ? ' Valid' : ' Check failed');
   const subtitle = format === 'jwe'
-    ? ['Encrypted JWT (JWE) · ', h('code', `${header?.alg} / ${header?.enc}`), ' · decrypted with the RP key']
+    ? ['Encrypted JWT (JWE) · ', h('code', `${header?.alg} / ${header?.enc}`), ' · decrypted with your private key']
     : ['Signed JWT · ', h('code', header?.alg || '?'), header?.kid ? [' · kid ', h('code', header.kid)] : null];
 
   let panel;
@@ -521,15 +746,14 @@ function idTokenCard(r) {
 
 function idTokenClaimsPanel(r) {
   const payload = r.idToken.payload;
-  const requested = requestedClaimKeys(r.request?.selection?.claims || null);
-  const requestedIdToken = Object.keys(r.request?.selection?.claims?.id_token || {});
-  const essential = new Set(Object.entries(r.request?.selection?.claims?.id_token || {}).filter(([, v]) => v?.essential).map(([k]) => k));
+  const requestedIdToken = Object.keys(r.request?.claims?.id_token || {});
+  const essential = new Set(Object.entries(r.request?.claims?.id_token || {}).filter(([, v]) => v?.essential).map(([k]) => k));
 
   const userKeys = Object.keys(payload).filter((k) => !TOKEN_CLAIMS.includes(k));
   const missing = requestedIdToken.filter((k) => !(k in payload));
   const rows = [
-    ...userKeys.map((k) => ({ key: k, value: payload[k], missing: false, requested: requested.includes(k) })),
-    ...missing.map((k) => ({ key: k, value: undefined, missing: true, requested: true })),
+    ...userKeys.map((k) => ({ key: k, value: payload[k], missing: false })),
+    ...missing.map((k) => ({ key: k, value: undefined, missing: true })),
   ];
 
   const tokenRows = TOKEN_CLAIMS.filter((k) => k in payload).map((k) => {
@@ -546,13 +770,13 @@ function idTokenClaimsPanel(r) {
   return h('div.stack-lg', {},
     h('div.stack-sm', {},
       h('h3.subhead', 'About the user'),
-      rows.length ? claimsTable(rows, { essential, showRequested: true }) : h('p.muted', 'The ID token carries no user claims; request some for the ID token, or look at UserInfo.'),
+      rows.length ? claimsTable(rows, { essential }) : h('p.muted', 'The ID token carries no user claims; request some for the ID token, or look at UserInfo.'),
     ),
     h('div.stack-sm', {}, h('h3.subhead', 'About the token'), kvRows(tokenRows, { keyWidth: 'minmax(100px, 140px)' })),
   );
 }
 
-function claimsTable(rows, { essential = new Set(), showRequested = false } = {}) {
+function claimsTable(rows, { essential = new Set() } = {}) {
   return h('div.table-wrap', {},
     h('div.table', {},
       h('div.table-head', {}, h('span', 'Label'), h('span', 'Claim'), h('span', 'Value'), h('span', { 'aria-label': 'Returned' })),
@@ -593,7 +817,7 @@ function decodedPanel(r) {
     block('dot-payload', 'Payload', h('pre.code', pretty(payload))),
     block('dot-sig', 'Signature', h('div.note', {},
       format === 'jwe'
-        ? ['The token was decrypted with the RP private key; the nested JWS signature was verified against the provider’s ', h('code', 'jwks_uri'), '.']
+        ? ['The token was decrypted with the pasted private key; the nested JWS signature was verified against the provider’s ', h('code', 'jwks_uri'), '.']
         : [h('code', header?.alg || '?'), ' over ', h('code', 'base64url(header).base64url(payload)'), ', verified with the public key', header?.kid ? [' ', h('code', `kid=${header.kid}`)] : null, ' from the provider’s ', h('code', 'jwks_uri'), '.'],
     )),
   );
@@ -626,7 +850,7 @@ function tokenResponseCard(r) {
   if (t.refresh_token) rows.push({ k: 'refresh_token', node: tokenValue(t.refresh_token) });
   rows.push({ k: 'id_token', node: tokenValue(t.id_token) });
   return card('Token response', null, [
-    h('div.endpoint-box.mono', state.config?.discovery?.endpoints?.token_endpoint || 'token endpoint'),
+    h('div.endpoint-box.mono', r.endpoints?.token_endpoint || 'token endpoint'),
     kvRows(rows, { keyWidth: 'minmax(100px, 120px)' }),
   ], { id: 'h-tokenresp', right: h('span.tag.tag-ok.mono', 'POST 200') });
 }
@@ -649,20 +873,21 @@ function checksCard(title, subtitle, checks, id) {
 function requestSentCard(r, { open = false } = {}) {
   const req = r.request;
   if (!req) return null;
-  const details = h('details.details', { open: open || null },
-    h('summary.details-summary', {}, 'Request sent', h('span.muted', ` · ${req.params.length} parameters`)),
-    h('div.stack-sm', {},
-      h('div.endpoint-box.mono.break', new URL(req.url).origin + new URL(req.url).pathname),
-      kvRows(req.params.map((p) => ({ k: p.k, v: p.v })), { keyWidth: 'minmax(110px, 170px)' }),
-      copyButton('Copy full URL', req.url, 'btn-sm'),
+  return h('section.card', {},
+    h('details.details', { open: open || null },
+      h('summary.details-summary', {}, 'Request sent', h('span.muted', ` · ${req.params.length} parameters`)),
+      h('div.stack-sm', {},
+        h('div.endpoint-box.mono.break', req.endpoint),
+        kvRows(req.params, { keyWidth: 'minmax(110px, 170px)' }),
+        copyButton('Copy full URL', req.url, 'btn-sm'),
+      ),
     ),
   );
-  return h('section.card', {}, details);
 }
 
 function userinfoCard(r) {
   const ui = r.userinfo;
-  const endpoint = state.config?.discovery?.endpoints?.userinfo_endpoint || 'userinfo endpoint';
+  const endpoint = r.endpoints?.userinfo_endpoint || 'userinfo endpoint';
 
   if (!ui) {
     return card('UserInfo', ['Call the ', h('code', 'userinfo_endpoint'), ' with the access token and see the plain values the provider returns.'],
@@ -670,7 +895,7 @@ function userinfoCard(r) {
         h('div.endpoint-box.mono', `GET ${endpoint}`),
         h('button.btn.btn-primary.btn-lg', { type: 'button', disabled: state.userinfoBusy, onclick: callUserinfo },
           state.userinfoBusy ? 'Calling userinfo…' : 'Call the userinfo endpoint', icon('arrow', 18)),
-        state.userinfoError ? h('div.banner.banner-err', {}, icon('alert', 18), h('div', {}, state.userinfoError)) : null,
+        state.userinfoError ? errorBanner(state.userinfoError) : null,
       ),
       { id: 'h-userinfo' });
   }
@@ -684,15 +909,15 @@ function userinfoCard(r) {
   if (!ui.ok) {
     return card('UserInfo', null, [
       meta,
-      h('div.banner.banner-err', {}, icon('alert', 18), h('div', {}, h('strong', `${ui.error.error}: `), ui.error.error_description)),
+      errorBanner(ui.error),
       ui.response.body ? h('pre.code', ui.response.body) : null,
       h('button.btn.btn-ghost', { type: 'button', onclick: callUserinfo }, 'Try again'),
     ], { id: 'h-userinfo', right: statusTag });
   }
 
   const claims = ui.claims || {};
-  const requestedUserinfo = Object.keys(r.request?.selection?.claims?.userinfo || {});
-  const essential = new Set(Object.entries(r.request?.selection?.claims?.userinfo || {}).filter(([, v]) => v?.essential).map(([k]) => k));
+  const requestedUserinfo = Object.keys(r.request?.claims?.userinfo || {});
+  const essential = new Set(Object.entries(r.request?.claims?.userinfo || {}).filter(([, v]) => v?.essential).map(([k]) => k));
   const keys = ['sub', ...Object.keys(claims).filter((k) => k !== 'sub')];
   const missing = requestedUserinfo.filter((k) => !(k in claims));
   const rows = [
@@ -718,11 +943,10 @@ function userinfoCard(r) {
   if (differs.length) notes.push({ ok: false, text: `Values differ from the ID token for: ${differs.map(shortClaimName).join(', ')}.` });
   else if (returned.some((k) => k in idTokenPayload)) notes.push({ ok: true, text: 'Every value that is also in the ID token is identical.' });
 
-  const panel = state.userinfoTab === 'raw'
-    ? h('pre.code', ui.response.body)
-    : claimsTable(rows, { essential });
+  const panel = state.userinfoTab === 'raw' ? h('pre.code', ui.response.body) : claimsTable(rows, { essential });
+  const formatLabel = ui.format === 'json' ? 'application/json' : ui.format === 'jwt' ? 'signed JWT (verified)' : 'encrypted JWT (decrypted + verified)';
 
-  return card('UserInfo', [`${Object.keys(claims).length} claims · `, h('code', ui.format === 'json' ? 'application/json' : ui.format === 'jwt' ? 'signed JWT (verified)' : 'encrypted JWT (decrypted + verified)')], [
+  return card('UserInfo', [`${Object.keys(claims).length} claims · `, h('code', formatLabel)], [
     meta,
     tabs([['plain', 'Plain values'], ['raw', ui.format === 'json' ? 'Raw JSON' : 'Raw response']], state.userinfoTab, (id) => { state.userinfoTab = id; render(); }),
     h('div', { role: 'tabpanel' }, panel),
@@ -734,20 +958,28 @@ function userinfoCard(r) {
 }
 
 async function callUserinfo() {
+  const r = state.result;
+  if (!r || r.status !== 'ok') return;
   state.userinfoBusy = true;
   state.userinfoError = null;
   render();
-  try {
-    const userinfo = await api.userinfo();
-    state.result.userinfo = userinfo;
+  const res = await api.userinfo({
+    issuer: r.config.issuer,
+    client_id: r.config.clientId,
+    access_token: r.tokens.access_token,
+    expected_sub: r.idToken.payload.sub,
+    private_key: state.secrets.privateKey.trim() || undefined,
+  });
+  state.userinfoBusy = false;
+  if (!res.ok) {
+    state.userinfoError = res.error;
+  } else {
+    r.userinfo = res.userinfo;
     state.userinfoTab = 'plain';
-  } catch (err) {
-    state.userinfoError = err.message;
-  } finally {
-    state.userinfoBusy = false;
-    render();
+    saveResult();
   }
+  render();
 }
 
-// expose a little for debugging in the console
-window.__oidcPlayground = { state, buildScopeList, buildClaimsParameter };
+// a little hook for debugging in the console
+window.__oidcPlayground = { state, redirectUri };

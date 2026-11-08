@@ -60,7 +60,24 @@ export const ACR_PRESETS = [
   { value: `${ITSME_CLAIM_PREFIX}acr_advanced`, label: 'acr_advanced · PIN only' },
 ];
 
+export const ISSUER_PRESETS = [
+  { id: 'itsme-e2e', label: 'itsme® sandbox (e2e)', issuer: 'https://idp.e2e.itsme.services/v2' },
+  { id: 'itsme-prd', label: 'itsme® production', issuer: 'https://idp.prd.itsme.services/v2' },
+  { id: 'mock', label: 'Local mock provider (npm run mock-op)', issuer: 'http://localhost:9000' },
+];
+
+export const CLIENT_AUTH_METHODS = [
+  { id: 'client_secret_post', label: 'client_secret_post · secret in the token request body' },
+  { id: 'client_secret_basic', label: 'client_secret_basic · HTTP Basic on the token endpoint' },
+  { id: 'private_key_jwt', label: 'private_key_jwt · signed client assertion (itsme recommended)' },
+  { id: 'none', label: 'none · public client (PKCE only)' },
+];
+
 export const DEFAULT_SELECTION = {
+  issuer: 'https://idp.e2e.itsme.services/v2',
+  clientId: '',
+  clientAuthMethod: 'client_secret_post',
+  serviceCode: '',
   scopes: { service: true, profile: true, email: true, phone: true },
   claims: {
     name: true, given_name: true, family_name: true, birthdate: true, gender: true, locale: true,
@@ -111,6 +128,24 @@ export function buildStartRequest(selection, serviceCode) {
   if (selection.maxAge !== '' && selection.maxAge !== null && selection.maxAge !== undefined) body.max_age = Number(selection.maxAge);
   if (selection.loginHint) body.login_hint = selection.loginHint;
   return body;
+}
+
+/** Ordered authorization request parameters, exactly as they go on the wire. */
+export function buildAuthorizationParams(body, { clientId, redirectUri, state, nonce, codeChallenge }) {
+  const params = [
+    ['response_type', 'code'],
+    ['client_id', clientId],
+    ['redirect_uri', redirectUri],
+    ['scope', body.scopes.join(' ')],
+    ['state', state],
+    ['nonce', nonce],
+  ];
+  if (body.pkce && codeChallenge) params.push(['code_challenge', codeChallenge], ['code_challenge_method', 'S256']);
+  for (const k of ['acr_values', 'prompt', 'ui_locales', 'max_age', 'login_hint']) {
+    if (body[k] !== undefined && body[k] !== null && body[k] !== '') params.push([k, String(body[k])]);
+  }
+  if (body.claims) params.push(['claims', JSON.stringify(body.claims)]);
+  return params;
 }
 
 /** The names of all individually requested claims (keys as sent to the provider). */

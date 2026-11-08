@@ -1,14 +1,13 @@
-// Entry point: load settings and keys, build the app, listen over HTTP or HTTPS.
+// Entry point: load server settings, build the app, listen over HTTP or HTTPS.
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
 import { loadSettings, SettingsError } from './config.js';
-import { loadRpKeys } from './keys.js';
 import { createOidc } from './oidc.js';
 import { createApp } from './app.js';
 
-async function main() {
+function main() {
   let settings;
   try {
     settings = loadSettings();
@@ -20,9 +19,8 @@ async function main() {
     throw err;
   }
 
-  const rpKeys = await loadRpKeys(settings);
-  const oidc = createOidc(settings, rpKeys);
-  const app = createApp({ settings, oidc, rpKeys });
+  const oidc = createOidc(settings);
+  const app = createApp({ settings, oidc });
 
   const server = settings.tls
     ? https.createServer(
@@ -35,28 +33,11 @@ async function main() {
     : http.createServer(app);
 
   server.listen(settings.port, settings.host, () => {
-    console.log(`OIDC playground  →  ${settings.baseUrl}`);
-    console.log(`  provider       ${settings.providerLabel}`);
-    console.log(`  issuer         ${settings.issuer}`);
-    console.log(`  client_id      ${settings.clientId}`);
-    console.log(`  client auth    ${settings.clientAuth}${rpKeys ? ` (kid ${rpKeys.kid})` : ''}`);
-    console.log(`  redirect_uri   ${settings.redirectUri}`);
-    if (settings.tls) console.log('  tls            on');
+    const scheme = settings.tls ? 'https' : 'http';
+    console.log(`OIDC playground  →  ${scheme}://localhost:${settings.port}`);
+    console.log(`  redirect URI   ${scheme}://localhost:${settings.port}/callback  (register this at the provider)`);
+    console.log('  state          none kept server-side; provider & client details come from the page');
   });
-
-  // Warm up discovery so the first click is fast; failures are shown in the UI.
-  oidc
-    .getConfiguration()
-    .then((configuration) => {
-      const md = configuration.serverMetadata();
-      console.log(`  discovery      ok · ${md.authorization_endpoint}`);
-    })
-    .catch((err) => {
-      console.warn(`  discovery      failed · ${err.message}${err.cause ? ` (${err.cause.code || err.cause.message})` : ''}`);
-    });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main();

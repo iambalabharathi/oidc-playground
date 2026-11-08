@@ -1,32 +1,30 @@
-// Calls to our own backend. The browser never talks to the provider directly
-// except for the redirect to the authorization endpoint.
+// Calls to our own stateless backend. Every call carries what it needs; the
+// server remembers nothing between calls.
 
-async function request(path, init = {}) {
-  const response = await fetch(path, {
-    ...init,
-    headers: { Accept: 'application/json', ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) },
-    credentials: 'same-origin',
-  });
-  let body = null;
+async function post(path, body) {
+  let response;
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
+  } catch (err) {
+    return { ok: false, error: { error: 'network_error', error_description: `Cannot reach the backend (${err.message}). Is the server running?` } };
+  }
   const text = await response.text();
   try {
-    body = text ? JSON.parse(text) : null;
+    const json = JSON.parse(text);
+    if (json && typeof json === 'object' && 'ok' in json) return json;
+    return { ok: false, error: { error: 'bad_response', error_description: text.slice(0, 300) } };
   } catch {
-    body = { error: 'bad_response', error_description: text.slice(0, 300) };
+    return { ok: false, error: { error: 'bad_response', error_description: `HTTP ${response.status}: ${text.slice(0, 300)}` } };
   }
-  if (!response.ok) {
-    const err = new Error(body?.error_description || body?.detail?.error_description || body?.error || `HTTP ${response.status}`);
-    err.status = response.status;
-    err.body = body;
-    throw err;
-  }
-  return body;
 }
 
 export const api = {
-  config: () => request('/api/config'),
-  start: (selection) => request('/api/auth/start', { method: 'POST', body: JSON.stringify(selection) }),
-  result: () => request('/api/result'),
-  userinfo: () => request('/api/userinfo', { method: 'POST', body: '{}' }),
-  reset: () => request('/api/reset', { method: 'POST', body: '{}' }),
+  discover: (issuer) => post('/api/discover', { issuer }),
+  token: (body) => post('/api/token', body),
+  userinfo: (body) => post('/api/userinfo', body),
+  inspectKey: (privateKey) => post('/api/keys/inspect', { private_key: privateKey }),
 };

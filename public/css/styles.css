@@ -1001,3 +1001,47 @@ input[type='checkbox'] {
   .cell-value { grid-area: value; }
   .cell-status { grid-area: status; justify-self: end; }
 }
+
+/* ---- form extras (stateless form) --------------------------------------------- */
+
+.input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.input-row .input { flex: 1 1 auto; min-width: 0; }
+.input-row .btn { flex-shrink: 0; }
+
+.textarea {
+  height: auto;
+  min-height: 120px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.spinner-xs {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+}
+
+.note-ok { background: var(--ok-soft); color: var(--ok); }
+.note-ok .field-hint { color: var(--ok); }
+.note-err { background: var(--err-soft); color: var(--err); }
+.note > svg { vertical-align: -2px; }
+
+.plain-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.plain-list li { margin: 2px 0; }
+
+.chips-sm { gap: 6px; }
+.chips-sm .tag { background: var(--surface-2); color: var(--label); }

@@ -1,7 +1,7 @@
 {
   "name": "oidc-playground",
   "version": "0.1.0",
-  "description": "Pick OIDC claims, authorize at the provider, inspect the ID token and the UserInfo response.",
+  "description": "Stateless OpenID Connect playground: fill in provider + client, pick claims, authorize, inspect the ID token and UserInfo.",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,7 +9,6 @@
   },
   "scripts": {
     "start": "node -r dotenv/config server/index.js",
-    "start:mock": "DOTENV_CONFIG_PATH=mock.env node -r dotenv/config server/index.js",
     "mock-op": "node tools/mock-op.js",
     "cert": "sh tools/gen-cert.sh",
     "test": "node --test"
@@ -17,7 +16,6 @@
   "dependencies": {
     "dotenv": "^18.0.0",
     "express": "^5.1.0",
-    "express-session": "^1.18.0",
     "jose": "^6.0.0",
     "openid-client": "^6.6.0"
   }

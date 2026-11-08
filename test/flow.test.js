@@ -1,95 +1,93 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bootStack, makeSession } from '../tools/stack-for-tests.js';
+import { bootStack, makeApi, startFlow, authorizeAtMock } from '../tools/stack-for-tests.js';
 
 const BE_NN = 'http://itsme.services/v2/claim/BENationalNumber';
-
-const selection = {
-  scopes: ['openid', 'service:TESTSERVICE', 'profile', 'email', 'phone'],
-  claims: {
-    userinfo: { email: { essential: true }, gender: null, [BE_NN]: { essential: true } },
-    id_token: { email: { essential: true }, gender: null, [BE_NN]: { essential: true } },
-  },
-  acr_values: 'http://itsme.services/v2/claim/acr_basic',
-  ui_locales: 'nl',
-  pkce: true,
+const CLAIMS = {
+  userinfo: { email: { essential: true }, gender: null, [BE_NN]: { essential: true } },
+  id_token: { email: { essential: true }, gender: null, [BE_NN]: { essential: true } },
 };
 
-async function runAuthorization(session, body = selection) {
-  const start = await session.post('/api/auth/start', body);
-  const startBody = await start.text();
-  assert.equal(start.status, 200, startBody);
-  const { url, params } = JSON.parse(startBody);
-
-  // the browser would now be redirected to the provider; the mock auto-approves
-  const atProvider = await fetch(url, { redirect: 'manual' });
-  assert.equal(atProvider.status, 302);
-  const callbackUrl = atProvider.headers.get('location');
-  assert.ok(callbackUrl.includes('/callback?'), callbackUrl);
-
-  const callback = await session.call(callbackUrl);
-  assert.equal(callback.status, 302);
-  assert.equal(callback.headers.get('location'), '/result');
-  return { url, params, callbackUrl };
+function clientAuthFor(stack) {
+  return { method: 'client_secret_post', client_secret: stack.op.clientSecret };
 }
 
-test('full authorization code flow against the mock provider', async (t) => {
+test('full authorization code flow: discover → authorize → token → userinfo', async (t) => {
   const stack = await bootStack();
   t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
+  const api = makeApi(stack.baseUrl);
 
-  const config = await session.json('/api/config');
-  assert.equal(config.discovery.ok, true, JSON.stringify(config.discovery));
-  assert.equal(config.discovery.endpoints.userinfo_endpoint, `${stack.op.issuer}/userinfo`);
-  assert.equal(config.provider.serviceCode, 'TESTSERVICE');
+  const discovered = await api.post('/api/discover', { issuer: stack.op.issuer });
+  assert.equal(discovered.ok, true, JSON.stringify(discovered.error));
+  assert.equal(discovered.provider.endpoints.userinfo_endpoint, `${stack.op.issuer}/userinfo`);
+  assert.ok(discovered.provider.claims_parameter_supported);
 
-  const { params } = await runAuthorization(session);
-  const byName = Object.fromEntries(params.map((p) => [p.k, p.v]));
-  assert.equal(byName.response_type, 'code');
-  assert.equal(byName.client_id, stack.op.clientId);
-  assert.equal(byName.scope, 'openid service:TESTSERVICE profile email phone');
-  assert.equal(byName.code_challenge_method, 'S256');
-  assert.equal(byName.acr_values, 'http://itsme.services/v2/claim/acr_basic');
-  assert.deepEqual(JSON.parse(byName.claims), selection.claims);
+  const flow = startFlow({
+    authorizationEndpoint: discovered.provider.endpoints.authorization_endpoint,
+    clientId: stack.op.clientId,
+    redirectUri: stack.redirectUri,
+    scopes: ['openid', 'service:TESTSERVICE', 'profile', 'email', 'phone'],
+    claims: CLAIMS,
+    extra: { acr_values: 'http://itsme.services/v2/claim/acr_basic', ui_locales: 'nl' },
+  });
+  const callbackUrl = await authorizeAtMock(flow);
+  assert.ok(callbackUrl.startsWith(`${stack.redirectUri}?`), callbackUrl);
 
-  const result = await session.json('/api/result');
-  assert.equal(result.status, 'ok', JSON.stringify(result.error));
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer,
+    client_id: stack.op.clientId,
+    client_auth: clientAuthFor(stack),
+    callback_url: callbackUrl,
+    expected_state: flow.state,
+    expected_nonce: flow.nonce,
+    code_verifier: flow.codeVerifier,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.error));
   assert.equal(String(result.tokens.token_type).toLowerCase(), 'bearer');
   assert.match(result.tokens.id_token, /^eyJ/);
   assert.equal(result.idToken.header.alg, 'RS256');
   assert.equal(result.idToken.payload.iss, stack.op.issuer);
+  assert.equal(result.idToken.payload.nonce, flow.nonce);
   assert.equal(result.idToken.payload.email, 'lotte.vermeulen@example.com');
   assert.equal(result.idToken.payload[BE_NN], '91042312458');
   assert.equal(result.idToken.payload.gender, undefined, 'the mock omits gender on purpose');
   assert.equal(result.idToken.payload.acr, 'http://itsme.services/v2/claim/acr_basic');
   assert.ok(result.idToken.checks.length >= 7);
   assert.ok(result.idToken.checks.every((c) => c.ok), JSON.stringify(result.idToken.checks.filter((c) => !c.ok)));
-  assert.equal(result.request.selection.pkce, true);
+  assert.equal(result.endpoints.userinfo_endpoint, `${stack.op.issuer}/userinfo`);
 
-  const userinfo = await (await session.post('/api/userinfo')).json();
-  assert.equal(userinfo.ok, true, JSON.stringify(userinfo.error));
-  assert.equal(userinfo.format, 'json');
-  assert.equal(userinfo.response.status, 200);
-  assert.equal(userinfo.claims.sub, result.idToken.payload.sub);
-  assert.equal(userinfo.claims.phone_number, '+32470123456');
-  assert.equal(userinfo.claims.gender, undefined);
-  assert.ok(userinfo.checks.every((c) => c.ok));
-
-  const again = await session.json('/api/result');
-  assert.equal(again.userinfo.format, 'json', 'userinfo result is kept in the session');
-
-  const reset = await (await session.post('/api/reset')).json();
-  assert.equal(reset.ok, true);
-  assert.equal((await session.json('/api/result')).status, 'empty');
+  const ui = await api.post('/api/userinfo', {
+    issuer: stack.op.issuer,
+    client_id: stack.op.clientId,
+    access_token: result.tokens.access_token,
+    expected_sub: result.idToken.payload.sub,
+  });
+  assert.equal(ui.ok, true, JSON.stringify(ui.error));
+  assert.equal(ui.userinfo.ok, true, JSON.stringify(ui.userinfo.error));
+  assert.equal(ui.userinfo.format, 'json');
+  assert.equal(ui.userinfo.response.status, 200);
+  assert.equal(ui.userinfo.claims.sub, result.idToken.payload.sub);
+  assert.equal(ui.userinfo.claims.phone_number, '+32470123456');
+  assert.equal(ui.userinfo.claims.gender, undefined);
+  assert.ok(ui.userinfo.checks.every((c) => c.ok));
 });
 
 test('UserInfo returned as a signed JWT is verified and shown as claims', async (t) => {
   const stack = await bootStack({ mockOptions: { userinfoJwt: true } });
   t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
-  await runAuthorization(session, { scopes: ['openid', 'profile', 'email'], pkce: false });
+  const api = makeApi(stack.baseUrl);
+  const { provider } = await api.post('/api/discover', { issuer: stack.op.issuer });
+  const flow = startFlow({ authorizationEndpoint: provider.endpoints.authorization_endpoint, clientId: stack.op.clientId, redirectUri: stack.redirectUri, scopes: ['openid', 'profile', 'email'], pkce: false });
+  const callbackUrl = await authorizeAtMock(flow);
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, client_auth: clientAuthFor(stack),
+    callback_url: callbackUrl, expected_state: flow.state, expected_nonce: flow.nonce,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.error));
 
-  const userinfo = await (await session.post('/api/userinfo')).json();
+  const { userinfo } = await api.post('/api/userinfo', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, access_token: result.tokens.access_token, expected_sub: result.idToken.payload.sub,
+  });
   assert.equal(userinfo.ok, true, JSON.stringify(userinfo.error));
   assert.equal(userinfo.format, 'jwt');
   assert.equal(userinfo.response.contentType.split(';')[0], 'application/jwt');
@@ -98,61 +96,92 @@ test('UserInfo returned as a signed JWT is verified and shown as claims', async 
   assert.ok(userinfo.checks.some((c) => c.title === 'sub equals the ID token subject' && c.ok));
 });
 
+test('client_secret_basic works too', async (t) => {
+  const stack = await bootStack();
+  t.after(() => stack.close());
+  const api = makeApi(stack.baseUrl);
+  const { provider } = await api.post('/api/discover', { issuer: stack.op.issuer });
+  const flow = startFlow({ authorizationEndpoint: provider.endpoints.authorization_endpoint, clientId: stack.op.clientId, redirectUri: stack.redirectUri });
+  const callbackUrl = await authorizeAtMock(flow);
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, client_auth: { method: 'client_secret_basic', client_secret: stack.op.clientSecret },
+    callback_url: callbackUrl, expected_state: flow.state, expected_nonce: flow.nonce, code_verifier: flow.codeVerifier,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+});
+
+test('a wrong client secret is reported as invalid_client', async (t) => {
+  const stack = await bootStack();
+  t.after(() => stack.close());
+  const api = makeApi(stack.baseUrl);
+  const { provider } = await api.post('/api/discover', { issuer: stack.op.issuer });
+  const flow = startFlow({ authorizationEndpoint: provider.endpoints.authorization_endpoint, clientId: stack.op.clientId, redirectUri: stack.redirectUri });
+  const callbackUrl = await authorizeAtMock(flow);
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, client_auth: { method: 'client_secret_post', client_secret: 'nope' },
+    callback_url: callbackUrl, expected_state: flow.state, expected_nonce: flow.nonce, code_verifier: flow.codeVerifier,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.error, 'invalid_client');
+  assert.equal(result.error.status, 401);
+});
+
 test('an access_denied callback is reported, not crashed on', async (t) => {
   const stack = await bootStack({ mockOptions: { autoApprove: false } });
   t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
+  const api = makeApi(stack.baseUrl);
+  const { provider } = await api.post('/api/discover', { issuer: stack.op.issuer });
+  const flow = startFlow({ authorizationEndpoint: provider.endpoints.authorization_endpoint, clientId: stack.op.clientId, redirectUri: stack.redirectUri });
 
-  const start = await session.post('/api/auth/start', { scopes: ['openid'], pkce: true });
-  const { url } = await start.json();
-  const page = await fetch(url);
-  const html = await page.text();
+  const consent = await fetch(flow.url);
+  const html = await consent.text();
   const denyUrl = stack.op.issuer + html.match(/href="([^"]+)"\s*>Deny/)[1].replace(/&amp;/g, '&');
-
   const decision = await fetch(denyUrl, { redirect: 'manual' });
-  assert.equal(decision.status, 302);
-  const callback = await session.call(decision.headers.get('location'));
-  assert.equal(callback.status, 302);
-  const result = await session.json('/api/result');
-  assert.equal(result.status, 'error');
+  const callbackUrl = decision.headers.get('location');
+  assert.match(callbackUrl, /error=access_denied/);
+
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, client_auth: clientAuthFor(stack),
+    callback_url: callbackUrl, expected_state: flow.state, expected_nonce: flow.nonce, code_verifier: flow.codeVerifier,
+  });
+  assert.equal(result.ok, false);
   assert.equal(result.error.error, 'access_denied');
   assert.equal(result.error.stage, 'authorization');
 });
 
-test('a callback without a pending request explains itself', async (t) => {
+test('a tampered state is rejected', async (t) => {
   const stack = await bootStack();
   t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
-  const res = await session.call('/callback?code=abc&state=xyz');
-  assert.equal(res.status, 302);
-  const result = await session.json('/api/result');
-  assert.equal(result.status, 'error');
-  assert.equal(result.error.error, 'no_pending_request');
-});
-
-test('a tampered state is rejected by the token exchange step', async (t) => {
-  const stack = await bootStack();
-  t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
-  const { url } = await (await session.post('/api/auth/start', { scopes: ['openid'], pkce: true })).json();
-  const atProvider = await fetch(url, { redirect: 'manual' });
-  const callbackUrl = new URL(atProvider.headers.get('location'));
+  const api = makeApi(stack.baseUrl);
+  const { provider } = await api.post('/api/discover', { issuer: stack.op.issuer });
+  const flow = startFlow({ authorizationEndpoint: provider.endpoints.authorization_endpoint, clientId: stack.op.clientId, redirectUri: stack.redirectUri });
+  const callbackUrl = new URL(await authorizeAtMock(flow));
   callbackUrl.searchParams.set('state', 'not-the-state-we-sent');
-  await session.call(callbackUrl.href);
-  const result = await session.json('/api/result');
-  assert.equal(result.status, 'error');
+  const result = await api.post('/api/token', {
+    issuer: stack.op.issuer, client_id: stack.op.clientId, client_auth: clientAuthFor(stack),
+    callback_url: callbackUrl.href, expected_state: flow.state, expected_nonce: flow.nonce, code_verifier: flow.codeVerifier,
+  });
+  assert.equal(result.ok, false);
   assert.match(result.error.error_description, /state/i);
 });
 
-test('invalid start requests are rejected with details', async (t) => {
+test('invalid requests are rejected with details', async (t) => {
   const stack = await bootStack();
   t.after(() => stack.close());
-  const session = makeSession(stack.baseUrl);
-  const res = await session.post('/api/auth/start', { scopes: ['openid'], claims: { foo: {} }, prompt: 'none login', max_age: -1 });
-  assert.equal(res.status, 400);
-  const body = await res.json();
-  assert.equal(body.error, 'invalid_request');
-  assert.ok(body.errors.some((e) => e.includes('claims.foo')));
-  assert.ok(body.errors.some((e) => e.includes('prompt=none')));
-  assert.ok(body.errors.some((e) => e.includes('max_age')));
+  const api = makeApi(stack.baseUrl);
+
+  const bad = await api.post('/api/token', { issuer: 'ftp://x', client_auth: { method: 'private_key_jwt' }, callback_url: 'nope', code_verifier: 'short' });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.error.error, 'invalid_request');
+  for (const needle of ['issuer', 'client_id', 'private_key', 'callback_url', 'expected_state', 'code_verifier']) {
+    assert.ok(bad.error.errors.some((e) => e.includes(needle)), `expected an error about ${needle}: ${bad.error.errors.join(' | ')}`);
+  }
+
+  const insecure = await api.post('/api/discover', { issuer: 'http://example.com' });
+  assert.equal(insecure.ok, false);
+  assert.match(insecure.error.error_description, /localhost/);
+
+  const unknown = await api.post('/api/discover', { issuer: 'http://127.0.0.1:9' });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.error.stage, 'discovery');
 });

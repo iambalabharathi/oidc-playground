@@ -1,12 +1,7 @@
-// Validation of what the browser sends to POST /api/auth/start. The server
-// never trusts the page: scopes, the claims object and the optional request
-// parameters are checked here before anything reaches the provider.
+// Validation of what the page sends. The server trusts nothing from the browser:
+// every URL, identifier and credential is checked before it is used.
 
-const SCOPE_TOKEN = /^[\x21\x23-\x5B\x5D-\x7E]{1,128}$/; // RFC 6749 §3.3 scope-token
-const PROMPT_VALUES = ['none', 'login', 'consent', 'select_account'];
-const CLAIM_TARGETS = ['id_token', 'userinfo'];
-const CLAIM_REQUEST_KEYS = ['essential', 'value', 'values'];
-const MAX_CLAIMS_PER_TARGET = 80;
+const CLIENT_AUTH_METHODS = ['client_secret_post', 'client_secret_basic', 'private_key_jwt', 'none'];
 
 export class ValidationError extends Error {
   constructor(errors) {
@@ -16,126 +11,129 @@ export class ValidationError extends Error {
   }
 }
 
-export function validateStartRequest(body) {
-  const errors = [];
-  const input = body && typeof body === 'object' ? body : {};
-
-  // scopes
-  let scopes = Array.isArray(input.scopes) ? input.scopes : [];
-  scopes = scopes.map((s) => String(s).trim()).filter(Boolean);
-  if (scopes.length > 30) errors.push('too many scopes (max 30)');
-  for (const scope of scopes) {
-    if (!SCOPE_TOKEN.test(scope)) errors.push(`invalid scope token "${scope}"`);
-  }
-  if (!scopes.includes('openid')) scopes.unshift('openid');
-  scopes = [...new Set(scopes)];
-
-  // claims parameter
-  let claims = null;
-  if (input.claims !== undefined && input.claims !== null) {
-    const result = validateClaimsObject(input.claims);
-    errors.push(...result.errors);
-    claims = result.value;
-  }
-
-  // optional parameters
-  const options = {};
-  const acr = optionalString(input.acr_values, 'acr_values', 512, errors);
-  if (acr) options.acr_values = acr;
-
-  const prompt = optionalString(input.prompt, 'prompt', 64, errors);
-  if (prompt) {
-    const tokens = prompt.split(/\s+/);
-    const bad = tokens.filter((t) => !PROMPT_VALUES.includes(t));
-    if (bad.length) errors.push(`prompt contains unknown value(s): ${bad.join(', ')}`);
-    if (tokens.includes('none') && tokens.length > 1) errors.push('prompt=none cannot be combined with other values');
-    options.prompt = tokens.join(' ');
-  }
-
-  const uiLocales = optionalString(input.ui_locales, 'ui_locales', 100, errors);
-  if (uiLocales) options.ui_locales = uiLocales;
-
-  const loginHint = optionalString(input.login_hint, 'login_hint', 256, errors);
-  if (loginHint) options.login_hint = loginHint;
-
-  if (input.max_age !== undefined && input.max_age !== null && input.max_age !== '') {
-    const n = Number(input.max_age);
-    if (!Number.isInteger(n) || n < 0 || n > 31536000) errors.push('max_age must be an integer between 0 and 31536000');
-    else options.max_age = n;
-  }
-
-  const pkce = input.pkce === undefined ? true : Boolean(input.pkce);
-
-  if (errors.length) throw new ValidationError(errors);
-  return { scopes, claims, options, pkce };
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function validateClaimsObject(raw) {
-  const errors = [];
-  if (!isPlainObject(raw)) {
-    return { errors: ['claims must be a JSON object'], value: null };
+function str(value, name, { max = 2048, required = false } = {}, errors) {
+  if (value === undefined || value === null || value === '') {
+    if (required) errors.push(`${name} is required`);
+    return null;
   }
-  const value = {};
-  for (const [target, members] of Object.entries(raw)) {
-    if (!CLAIM_TARGETS.includes(target)) {
-      errors.push(`claims.${target} is not allowed (use id_token or userinfo)`);
-      continue;
-    }
-    if (!isPlainObject(members)) {
-      errors.push(`claims.${target} must be an object`);
-      continue;
-    }
-    const entries = Object.entries(members);
-    if (entries.length > MAX_CLAIMS_PER_TARGET) {
-      errors.push(`claims.${target} has too many entries (max ${MAX_CLAIMS_PER_TARGET})`);
-      continue;
-    }
-    const cleaned = {};
-    for (const [name, request] of entries) {
-      if (typeof name !== 'string' || name.length === 0 || name.length > 200) {
-        errors.push(`claims.${target} has an invalid claim name`);
-        continue;
-      }
-      if (request === null) {
-        cleaned[name] = null;
-        continue;
-      }
-      if (!isPlainObject(request)) {
-        errors.push(`claims.${target}.${name} must be null or an object`);
-        continue;
-      }
-      const spec = {};
-      for (const [k, v] of Object.entries(request)) {
-        if (!CLAIM_REQUEST_KEYS.includes(k)) {
-          errors.push(`claims.${target}.${name}.${k} is not allowed`);
-        } else if (k === 'essential' && typeof v !== 'boolean') {
-          errors.push(`claims.${target}.${name}.essential must be boolean`);
-        } else if (k === 'value' && !['string', 'number', 'boolean'].includes(typeof v)) {
-          errors.push(`claims.${target}.${name}.value must be a string, number or boolean`);
-        } else if (k === 'values' && !(Array.isArray(v) && v.every((x) => typeof x === 'string'))) {
-          errors.push(`claims.${target}.${name}.values must be an array of strings`);
-        } else {
-          spec[k] = v;
-        }
-      }
-      cleaned[name] = Object.keys(spec).length ? spec : null;
-    }
-    if (Object.keys(cleaned).length) value[target] = cleaned;
-  }
-  return { errors, value: Object.keys(value).length ? value : null };
-}
-
-function optionalString(value, name, max, errors) {
-  if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string') {
     errors.push(`${name} must be a string`);
     return null;
   }
   const trimmed = value.trim();
-  if (trimmed.length > max) errors.push(`${name} is too long (max ${max})`);
+  if (!trimmed && required) errors.push(`${name} is required`);
+  if (trimmed.length > max) errors.push(`${name} is too long (max ${max} characters)`);
   return trimmed || null;
 }
 
-function isPlainObject(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+export function normalizeIssuer(value, errors, name = 'issuer') {
+  const text = str(value, name, { max: 2048, required: true }, errors);
+  if (!text) return null;
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    errors.push(`${name} must be an absolute URL`);
+    return null;
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) errors.push(`${name} must use http or https`);
+  if (url.search || url.hash) errors.push(`${name} must not contain a query string or fragment`);
+  if (url.username || url.password) errors.push(`${name} must not contain credentials`);
+  return url.href.replace(/\/+$/, '');
+}
+
+export function validateClientAuth(value, errors) {
+  const input = isPlainObject(value) ? value : { method: value };
+  const method = str(input.method, 'client_auth.method', { max: 64 }, errors) || 'none';
+  if (!CLIENT_AUTH_METHODS.includes(method)) {
+    errors.push(`client_auth.method must be one of ${CLIENT_AUTH_METHODS.join(', ')}`);
+    return null;
+  }
+  const out = { method };
+  if (method.startsWith('client_secret')) {
+    out.client_secret = str(input.client_secret, 'client_auth.client_secret', { max: 4096, required: true }, errors);
+  }
+  if (input.private_key !== undefined && input.private_key !== null && input.private_key !== '') {
+    if (typeof input.private_key === 'string') {
+      if (input.private_key.length > 32768) errors.push('client_auth.private_key is too long');
+      out.private_key = input.private_key;
+    } else if (isPlainObject(input.private_key)) {
+      out.private_key = input.private_key;
+    } else {
+      errors.push('client_auth.private_key must be a JWK object, a JWK/JWKS JSON string or PEM');
+    }
+  }
+  if (method === 'private_key_jwt' && !out.private_key) {
+    errors.push('client_auth.method=private_key_jwt needs client_auth.private_key');
+  }
+  return out;
+}
+
+export function validateDiscoverRequest(body) {
+  const errors = [];
+  const issuer = normalizeIssuer(body?.issuer, errors);
+  if (errors.length) throw new ValidationError(errors);
+  return { issuer };
+}
+
+export function validateTokenRequest(body) {
+  const errors = [];
+  const input = isPlainObject(body) ? body : {};
+  const issuer = normalizeIssuer(input.issuer, errors);
+  const clientId = str(input.client_id, 'client_id', { max: 512, required: true }, errors);
+  const clientAuth = validateClientAuth(input.client_auth, errors);
+
+  const callbackUrl = str(input.callback_url, 'callback_url', { max: 16384, required: true }, errors);
+  if (callbackUrl) {
+    try {
+      const u = new URL(callbackUrl);
+      if (!['http:', 'https:'].includes(u.protocol)) errors.push('callback_url must be http(s)');
+    } catch {
+      errors.push('callback_url must be an absolute URL (the page URL the provider redirected to)');
+    }
+  }
+  const expectedState = str(input.expected_state, 'expected_state', { max: 512, required: true }, errors);
+  const expectedNonce = str(input.expected_nonce, 'expected_nonce', { max: 512 }, errors);
+  const codeVerifier = str(input.code_verifier, 'code_verifier', { max: 256 }, errors);
+  if (codeVerifier && !/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) errors.push('code_verifier is not a valid PKCE verifier');
+
+  let maxAge = null;
+  if (input.max_age !== undefined && input.max_age !== null && input.max_age !== '') {
+    const n = Number(input.max_age);
+    if (!Number.isInteger(n) || n < 0 || n > 31536000) errors.push('max_age must be an integer between 0 and 31536000');
+    else maxAge = n;
+  }
+
+  if (errors.length) throw new ValidationError(errors);
+  return { issuer, clientId, clientAuth, callbackUrl, expectedState, expectedNonce: expectedNonce || undefined, codeVerifier, maxAge };
+}
+
+export function validateUserinfoRequest(body) {
+  const errors = [];
+  const input = isPlainObject(body) ? body : {};
+  const issuer = normalizeIssuer(input.issuer, errors);
+  const clientId = str(input.client_id, 'client_id', { max: 512 }, errors);
+  const accessToken = str(input.access_token, 'access_token', { max: 16384, required: true }, errors);
+  const expectedSub = str(input.expected_sub, 'expected_sub', { max: 1024 }, errors);
+  let privateKeyMaterial = null;
+  if (input.private_key !== undefined && input.private_key !== null && input.private_key !== '') {
+    if (typeof input.private_key === 'string' || isPlainObject(input.private_key)) privateKeyMaterial = input.private_key;
+    else errors.push('private_key must be a JWK object, a JWK/JWKS JSON string or PEM');
+  }
+  if (errors.length) throw new ValidationError(errors);
+  return { issuer, clientId, accessToken, expectedSub, privateKeyMaterial };
+}
+
+export function validateInspectKeyRequest(body) {
+  const errors = [];
+  const input = isPlainObject(body) ? body : {};
+  if (input.private_key === undefined || input.private_key === null || input.private_key === '') errors.push('private_key is required');
+  else if (typeof input.private_key !== 'string' && !isPlainObject(input.private_key)) errors.push('private_key must be a JWK object, a JWK/JWKS JSON string or PEM');
+  else if (typeof input.private_key === 'string' && input.private_key.length > 32768) errors.push('private_key is too long');
+  if (errors.length) throw new ValidationError(errors);
+  return { privateKey: input.private_key };
 }
