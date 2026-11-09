@@ -1,21 +1,30 @@
-// HTTP layer: a stateless JSON API for the page plus static hosting.
-// The server never stores tokens, secrets or flow state — the page sends what
-// each call needs, gets the result back, and keeps it in the browser.
+// Optional local helper: a stateless JSON API the page can use for providers whose
+// endpoints do not allow cross-origin requests, plus static hosting of the page itself.
+// The server never stores tokens, secrets or flow state — the page sends what each
+// call needs, gets the result back, and keeps it in the browser.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { validateDiscoverRequest, validateTokenRequest, validateUserinfoRequest, validateInspectKeyRequest, ValidationError } from './validate.js';
 import { describeError } from './oidc.js';
 
-const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
+const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../docs');
 
 export function createApp({ settings, oidc, log = console }) {
   const app = express();
   app.disable('x-powered-by');
   if (settings.trustProxy) app.set('trust proxy', 1);
   app.use(express.json({ limit: '256kb' }));
+  // The page may be served from somewhere else (GitHub Pages) and call this helper cross-origin.
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
+    res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.set('Vary', 'Origin');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+    res.set('Access-Control-Allow-Private-Network', 'true');
+    res.set('Access-Control-Max-Age', '600');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
 
@@ -58,7 +67,7 @@ export function createApp({ settings, oidc, log = console }) {
   // --- Frontend --------------------------------------------------------------
   app.use(express.static(publicDir, { index: false, maxAge: 0 }));
   app.use((req, res, next) => {
-    // Client-side routes (/, /callback, /result) get the page; anything that looks like a file 404s.
+    // Any path without a file extension gets the page; anything that looks like a file 404s.
     if (req.method !== 'GET' || path.extname(req.path)) return next();
     res.sendFile(path.join(publicDir, 'index.html'));
   });

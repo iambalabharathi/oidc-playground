@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_SELECTION, ITSME_CLAIM_PREFIX,
   buildClaimsParameter, buildScopeList, buildStartRequest, requestedClaimKeys, shortClaimName, claimLabel,
-} from '../public/js/catalog.js';
+} from '../docs/js/catalog.js';
 
 const BE_NN = ITSME_CLAIM_PREFIX + 'BENationalNumber';
 

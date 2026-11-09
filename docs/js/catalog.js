@@ -78,6 +78,8 @@ export const DEFAULT_SELECTION = {
   clientId: '',
   clientAuthMethod: 'client_secret_post',
   serviceCode: '',
+  mode: 'direct', // direct (in the browser) | helper (local Node helper)
+  helperUrl: 'http://localhost:3000',
   scopes: { service: true, profile: true, email: true, phone: true },
   claims: {
     name: true, given_name: true, family_name: true, birthdate: true, gender: true, locale: true,

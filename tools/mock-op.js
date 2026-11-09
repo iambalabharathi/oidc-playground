@@ -83,6 +83,16 @@ export async function startMockOp(options = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.urlencoded({ extended: false }));
+  // The playground page talks to the mock straight from the browser, so allow any origin.
+  app.use((req, res, next) => {
+    res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.set('Vary', 'Origin');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept');
+    res.set('Access-Control-Allow-Private-Network', 'true');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
 
   let issuer = `http://localhost:${port}`;
   const metadata = () => ({

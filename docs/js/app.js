@@ -1,8 +1,9 @@
-// The page: a request builder at "/", the provider's redirect target at "/callback",
-// and the result at "/result". Everything the flow needs lives in this browser tab;
-// the backend is a stateless helper for discovery, the code exchange and UserInfo.
+// A static page (GitHub Pages friendly): the request builder, the provider's redirect
+// target and the result all live on this one URL. Everything the flow needs is kept in
+// this browser tab; the code exchange runs in the browser (oauth4webapi) or, for
+// providers without CORS, through the optional local helper.
 import { h, append, clear, icon, formatTime, formatIso, pretty, copyButton, truncateMiddle } from './ui.js';
-import { api } from './api.js';
+import { backendFor } from './backends.js';
 import {
   SCOPES, CLAIM_GROUPS, ACR_PRESETS, DEFAULT_SELECTION, TOKEN_CLAIMS, ISSUER_PRESETS, CLIENT_AUTH_METHODS,
   buildStartRequest, buildAuthorizationParams, requestedClaimKeys, claimLabel, shortClaimName,
@@ -12,6 +13,7 @@ const FORM_KEY = 'oidc-playground.form.v2'; // localStorage: everything that is 
 const SECRETS_KEY = 'oidc-playground.secrets.v2'; // sessionStorage: client secret, private key (this tab only)
 const PENDING_KEY = 'oidc-playground.pending.v2'; // sessionStorage: what we must remember across the redirect
 const RESULT_KEY = 'oidc-playground.result.v2'; // sessionStorage: the last result, so a reload keeps it
+const VIEW_KEY = 'oidc-playground.view.v2'; // sessionStorage: which view a reload comes back to
 const STEPS = ['Build request', 'Authorize', 'Tokens & claims', 'UserInfo'];
 
 const state = {
@@ -24,6 +26,7 @@ const state = {
   starting: false,
   startError: null,
   result: loadJson(sessionStorage, RESULT_KEY, null),
+  view: sessionStorage.getItem(VIEW_KEY) === 'result' ? 'result' : 'build',
   exchanging: false,
   userinfoBusy: false,
   userinfoError: null,
@@ -32,7 +35,9 @@ const state = {
 };
 
 const root = document.getElementById('app');
-const redirectUri = `${location.origin}/callback`;
+// The page itself is the redirect URI: on GitHub Pages that is https://<user>.github.io/<repo>/
+const redirectUri = `${location.origin}${location.pathname}`;
+const backend = () => backendFor(state.form);
 
 // --- storage ------------------------------------------------------------------------
 
@@ -58,36 +63,37 @@ function saveJson(storage, key, value) {
 const saveForm = () => saveJson(localStorage, FORM_KEY, state.form);
 const saveSecrets = () => saveJson(sessionStorage, SECRETS_KEY, state.secrets);
 const saveResult = () => saveJson(sessionStorage, RESULT_KEY, state.result);
+const saveView = () => {
+  try {
+    sessionStorage.setItem(VIEW_KEY, state.view);
+  } catch {
+    /* ignore */
+  }
+};
 
 // --- boot & routing -------------------------------------------------------------------
 
-function route() {
-  const p = location.pathname.replace(/\/+$/, '');
-  if (p === '/callback') return 'callback';
-  if (p === '/result') return 'result';
-  return 'build';
+function isCallback() {
+  const q = new URLSearchParams(location.search);
+  return q.has('code') || q.has('error') || (q.has('state') && q.has('iss'));
 }
 
-function navigate(path) {
-  history.pushState({}, '', path);
-  onRoute();
-}
-
-async function onRoute() {
-  if (route() === 'callback') return handleCallback();
+function show(view) {
+  state.view = view;
+  saveView();
   render();
+  window.scrollTo(0, 0);
 }
 
 async function boot() {
   render();
-  if (route() === 'callback') {
+  if (isCallback()) {
     await handleCallback();
   } else if (state.form.issuer) {
     await loadDiscovery();
   }
 }
 
-window.addEventListener('popstate', onRoute);
 boot();
 
 // --- discovery & key inspection ---------------------------------------------------------
@@ -100,7 +106,7 @@ async function loadDiscovery() {
   }
   state.discovering = true;
   render();
-  const res = await api.discover(issuer);
+  const res = await backend().discover(issuer);
   state.discovering = false;
   state.discovery = res.ok ? { issuer, provider: res.provider } : { issuer, error: res.error };
   render();
@@ -115,7 +121,7 @@ async function inspectKey() {
     state.keyInfo = null;
     return render();
   }
-  const res = await api.inspectKey(state.secrets.privateKey);
+  const res = await backend().inspectKey(state.secrets.privateKey);
   state.keyInfo = res.ok ? { key: res.key } : { error: res.error };
   render();
 }
@@ -126,7 +132,7 @@ function render() {
   const focused = document.activeElement?.id;
   const scrollY = window.scrollY;
   clear(root);
-  const view = route() === 'build' ? buildView() : resultView();
+  const view = state.view === 'result' || state.exchanging ? resultView() : buildView();
   append(root, [topbar(), view]);
   if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
   window.scrollTo(0, scrollY);
@@ -136,7 +142,7 @@ function renderPreviewOnly() {
   const slot = document.getElementById('preview-slot');
   if (!slot) return render();
   clear(slot);
-  append(slot, previewPanel());
+  append(slot, actionPanel());
 }
 
 function updateForm(mutator, { rerender = true } = {}) {
@@ -160,7 +166,7 @@ function providerLabel() {
 function topbar() {
   return h('header.topbar', {},
     h('div.topbar-inner', {},
-      h('a.brand', { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } },
+      h('a.brand', { href: redirectUri, onclick: (e) => { e.preventDefault(); show('build'); } },
         h('span.brand-mark', {}, icon('lock', 18, { strokeWidth: 2 })),
         h('span.brand-name', 'OIDC Playground'),
       ),
@@ -183,7 +189,7 @@ function resetEverything() {
   saveSecrets();
   saveResult();
   saveJson(sessionStorage, PENDING_KEY, null);
-  navigate('/');
+  show('build');
   loadDiscovery();
 }
 
@@ -197,7 +203,7 @@ function stepper(current) {
     const canNavigate = n === 1 && current !== 1;
     items.push(
       canNavigate
-        ? h(`a.step.${cls}`, { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } }, content)
+        ? h(`a.step.${cls}`, { href: redirectUri, onclick: (e) => { e.preventDefault(); show('build'); } }, content)
         : h(`div.step${cls ? '.' + cls : ''}`, { 'aria-current': n === current ? 'step' : null }, content),
     );
     if (i < STEPS.length - 1) items.push(h('span.step-sep', {}, icon('chevron', 16, { strokeWidth: 2 })));
@@ -251,7 +257,7 @@ function buildView() {
     stepper(1),
     h('div.page-head', {},
       h('h1.page-title', 'Build the authentication request'),
-      h('p.page-lead', 'Fill in the provider and your client, pick scopes and claims, press Authorize. Nothing is stored on the server — secrets stay in this browser tab.'),
+      h('p.page-lead', 'Fill in the provider and your client, pick scopes and claims, press Authorize. Nothing leaves this browser tab except the requests to the provider.'),
     ),
     h('div.columns', {},
       h('section.col-main', {},
@@ -260,7 +266,7 @@ function buildView() {
         claimsCard(f),
         optionsCard(f),
       ),
-      h('aside.col-side#preview-slot', {}, previewPanel()),
+      h('aside.col-side#preview-slot', {}, actionPanel()),
     ),
   );
 }
@@ -458,48 +464,51 @@ function optionsCard(f) {
     { id: 'h-options' });
 }
 
-function previewPanel() {
+function actionPanel() {
   const f = state.form;
   const provider = discoveryFor(f.issuer);
   const body = buildStartRequest(f, f.serviceCode);
-  const endpoint = provider ? provider.endpoints.authorization_endpoint : `${f.issuer.trim() || '<issuer>'}/… (load discovery)`;
-  const params = buildAuthorizationParams(body, {
-    clientId: f.clientId || '<client_id>',
-    redirectUri,
-    state: '{generated on Authorize}',
-    nonce: '{generated on Authorize}',
-    codeChallenge: '{S256 of a fresh verifier}',
-  }).map(([k, v]) => {
-    if (k === 'claims') {
-      const n = requestedClaimKeys(body.claims).length;
-      return { k, v: `{ ${Object.keys(body.claims).map((t) => `"${t}": { … ${n} }`).join(', ')} }  — see below` };
-    }
-    return { k, v };
-  });
-
   const problems = readinessProblems();
-  const previewUrl = () => {
-    const u = new URL(provider ? endpoint : 'https://provider.example/authorize');
-    for (const [k, v] of buildAuthorizationParams(body, { clientId: f.clientId || '<client_id>', redirectUri, state: '{state}', nonce: '{nonce}', codeChallenge: '{code_challenge}' })) u.searchParams.set(k, v);
-    return u.href;
-  };
+  const claimCount = requestedClaimKeys(body.claims).length;
+  const authLabel = CLIENT_AUTH_METHODS.find((m) => m.id === f.clientAuthMethod)?.id || f.clientAuthMethod;
+
+  const summary = kvRows([
+    { k: 'provider', v: provider ? provider.issuer : f.issuer.trim() || '—' },
+    { k: 'client_id', v: f.clientId || '—' },
+    { k: 'auth', v: authLabel },
+    { k: 'scope', v: body.scopes.join(' ') },
+    { k: 'claims', v: claimCount ? `${claimCount} individual claim${claimCount === 1 ? '' : 's'} → ${Object.keys(body.claims).join(' + ')}` : 'none (scopes only)' },
+    { k: 'pkce', v: body.pkce ? 'S256' : 'off' },
+  ], { keyWidth: 'minmax(80px, 100px)' });
+
+  const modeSelect = h('select.input#f-mode', {
+    onchange: (e) => { updateForm((st) => { st.mode = e.target.value; }); if (f.issuer) loadDiscovery(); },
+  },
+    h('option', { value: 'direct', selected: f.mode === 'direct' }, 'this browser (provider must allow CORS)'),
+    h('option', { value: 'helper', selected: f.mode === 'helper' }, 'local helper (npm start)'),
+  );
 
   return [
-    card('Authorization request', null, [
-      h('div.endpoint-box.mono', endpoint),
-      kvRows(params, { keyWidth: 'minmax(120px, 180px)' }),
-    ], { id: 'h-preview', right: h('span.tag.tag-ok.mono', 'GET') }),
-    card('claims parameter', ['Sent URL-encoded as ', h('code', 'claims='), '. ', h('code', 'null'), ' means voluntary.'],
-      h('pre.code', body.claims ? pretty(body.claims) : '{ }  // no individual claims selected'),
-      { id: 'h-claimsjson' }),
-    h('div.cta', {},
-      h('button.btn.btn-primary.btn-lg', { type: 'button', disabled: problems.length > 0 || state.starting, onclick: startAuthorization },
-        state.starting ? 'Redirecting…' : `Authorize with ${providerLabel().split('·')[0].trim()}`, icon('arrow', 18)),
-      problems.length ? h('ul.plain-list.muted.small', {}, problems.map((p) => h('li', p))) : null,
-      copyButton('Copy authorization URL (preview)', previewUrl),
-      state.startError ? errorBanner(state.startError) : null,
-      h('p.cta-note', {}, 'You leave for the provider and come back to ', h('code', '/callback'), '. state, nonce and the PKCE verifier are generated here in the browser and kept in this tab.'),
-    ),
+    card('Ready to authorize', 'What will be sent, in short.', [
+      summary,
+      h('div.fields', {},
+        field('Exchange the code through', modeSelect, { full: true }),
+        f.mode === 'helper'
+          ? field('Helper URL', h('input.input.mono#f-helper', {
+              type: 'url', value: f.helperUrl, placeholder: 'http://localhost:3000', spellcheck: 'false',
+              oninput: (e) => updateForm((st) => { st.helperUrl = e.target.value.trim(); }, { rerender: false }),
+              onchange: () => { if (f.issuer) loadDiscovery(); },
+            }), { full: true, hint: 'Run "npm start" from the repo; it does discovery, the token exchange and UserInfo for providers that block cross-origin requests.' })
+          : null,
+      ),
+      h('div.cta', {},
+        h('button.btn.btn-primary.btn-lg', { type: 'button', disabled: problems.length > 0 || state.starting, onclick: startAuthorization },
+          state.starting ? 'Redirecting…' : `Authorize with ${providerLabel().split('·')[0].trim()}`, icon('arrow', 18)),
+        problems.length ? h('ul.plain-list.muted.small', {}, problems.map((p) => h('li', p))) : null,
+        state.startError ? errorBanner(state.startError) : null,
+        h('p.cta-note', {}, 'You leave for the provider and come back to this page with a one-time code. state, nonce and the PKCE verifier are generated here and kept in this tab.'),
+      ),
+    ], { id: 'h-ready' }),
   ];
 }
 
@@ -511,6 +520,7 @@ function readinessProblems() {
   if (!f.clientId.trim()) problems.push('Enter the client ID.');
   if (f.clientAuthMethod.startsWith('client_secret') && !state.secrets.clientSecret) problems.push('Enter the client secret.');
   if (f.clientAuthMethod === 'private_key_jwt' && !state.secrets.privateKey.trim()) problems.push('Paste the private key for private_key_jwt.');
+  if (f.mode === 'helper' && !/^https?:\/\//.test(f.helperUrl)) problems.push('Enter the helper URL.');
   if (!window.isSecureContext || !crypto.subtle) problems.push('Open the page over https or on localhost (needed to generate PKCE).');
   return problems;
 }
@@ -556,6 +566,9 @@ async function startAuthorization() {
       issuer: f.issuer.trim(),
       clientId: f.clientId.trim(),
       clientAuthMethod: f.clientAuthMethod,
+      mode: f.mode,
+      helperUrl: f.helperUrl,
+      redirectUri,
       state: stateValue,
       nonce,
       codeVerifier: pkce?.verifier || null,
@@ -580,7 +593,7 @@ async function startAuthorization() {
   }
 }
 
-// --- /callback: finish the flow with the backend ----------------------------------------------
+// --- back from the provider: finish the flow -------------------------------------------------
 
 async function handleCallback() {
   const query = Object.fromEntries(new URLSearchParams(location.search));
@@ -588,6 +601,7 @@ async function handleCallback() {
   const pending = loadJson(sessionStorage, PENDING_KEY, null);
   saveJson(sessionStorage, PENDING_KEY, null);
   const callback = { url: `${location.pathname}${location.search}`, query, receivedAt: new Date().toISOString() };
+  history.replaceState({}, '', location.pathname); // the one-time code must not stay in the address bar
 
   state.exchanging = true;
   render();
@@ -598,8 +612,7 @@ async function handleCallback() {
     state.tab = 'claims';
     state.userinfoTab = 'plain';
     saveResult();
-    history.replaceState({}, '', '/result');
-    render();
+    show('result');
   };
 
   if (!pending) {
@@ -625,11 +638,12 @@ async function handleCallback() {
   if (pending.clientAuthMethod.startsWith('client_secret')) clientAuth.client_secret = secrets.clientSecret;
   if (secrets.privateKey.trim()) clientAuth.private_key = secrets.privateKey;
 
-  const res = await api.token({
+  const res = await backendFor({ mode: pending.mode, helperUrl: pending.helperUrl }).token({
     issuer: pending.issuer,
     client_id: pending.clientId,
     client_auth: clientAuth,
     callback_url: callbackUrl,
+    redirect_uri: pending.redirectUri || redirectUri,
     expected_state: pending.state,
     expected_nonce: pending.nonce,
     code_verifier: pending.codeVerifier || undefined,
@@ -652,7 +666,7 @@ async function handleCallback() {
 }
 
 function configSummary(pending) {
-  return { issuer: pending.issuer, clientId: pending.clientId, clientAuthMethod: pending.clientAuthMethod };
+  return { issuer: pending.issuer, clientId: pending.clientId, clientAuthMethod: pending.clientAuthMethod, mode: pending.mode || 'direct', helperUrl: pending.helperUrl };
 }
 
 // --- result view -------------------------------------------------------------------------
@@ -667,7 +681,7 @@ function resultView() {
       h('div.card.card-center', {},
         h('h1.page-title', 'Nothing here yet'),
         h('p.muted', 'This tab has no completed authorization. Build a request and authorize to see tokens and claims.'),
-        h('a.btn.btn-primary', { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } }, 'Build a request', icon('arrow', 18)),
+        h('a.btn.btn-primary', { href: redirectUri, onclick: (e) => { e.preventDefault(); show('build'); } }, 'Build a request', icon('arrow', 18)),
       ),
     );
   }
@@ -685,14 +699,14 @@ function resultView() {
     ),
     h('div.page-head', {},
       h('h1.page-title', 'Tokens & ID token claims'),
-      h('p.page-lead', `${r.config.issuer} · client ${r.config.clientId} · ${r.config.clientAuthMethod}. Below is everything the ID token says — about the user and about itself.`),
+      h('p.page-lead', `${r.config.issuer} · client ${r.config.clientId} · ${r.config.clientAuthMethod} · exchanged ${r.config.mode === 'helper' ? 'through the local helper' : 'in this browser'}. Below is everything the ID token says — about the user and about itself.`),
     ),
     h('div.columns', {},
       h('section.col-main', {}, idTokenCard(r), userinfoCard(r)),
       h('aside.col-side', {}, tokenResponseCard(r), checksCard('ID token checks', 'OpenID Connect Core §3.1.3.7', r.idToken.checks, 'h-checks'), requestSentCard(r)),
     ),
     h('div.actions', {},
-      h('a.btn.btn-primary.btn-lg', { href: '/', onclick: (e) => { e.preventDefault(); navigate('/'); } }, icon('reset', 16, { strokeWidth: 2 }), 'Start a new request'),
+      h('a.btn.btn-primary.btn-lg', { href: redirectUri, onclick: (e) => { e.preventDefault(); show('build'); } }, icon('reset', 16, { strokeWidth: 2 }), 'Start a new request'),
       copyButton('Copy result as JSON', () => pretty(r)),
     ),
   );
@@ -703,7 +717,7 @@ function errorView(r) {
   const lead = e.stage === 'authorization'
     ? 'The provider sent back an error instead of an authorization code.'
     : e.stage === 'callback'
-      ? 'The callback could not be matched to a request from this tab.'
+      ? 'The provider sent us back, but this tab was not waiting for it.'
       : 'The authorization code could not be exchanged, or the ID token failed validation.';
   return h('main.main', {},
     stepper(e.stage === 'authorization' || e.stage === 'callback' ? 2 : 3),
@@ -714,7 +728,7 @@ function errorView(r) {
       h('aside.col-side', {}, r.callback?.query && Object.keys(r.callback.query).length ? card('Callback parameters', null, kvRows(Object.entries(r.callback.query).map(([k, v]) => ({ k, v }))), { id: 'h-cbq' }) : null),
     ),
     h('div.actions', {},
-      h('a.btn.btn-primary.btn-lg', { href: '/', onclick: (ev) => { ev.preventDefault(); navigate('/'); } }, icon('reset', 16, { strokeWidth: 2 }), 'Back to the request builder'),
+      h('a.btn.btn-primary.btn-lg', { href: redirectUri, onclick: (ev) => { ev.preventDefault(); show('build'); } }, icon('reset', 16, { strokeWidth: 2 }), 'Back to the request builder'),
     ),
   );
 }
@@ -963,7 +977,7 @@ async function callUserinfo() {
   state.userinfoBusy = true;
   state.userinfoError = null;
   render();
-  const res = await api.userinfo({
+  const res = await backendFor({ mode: r.config.mode, helperUrl: r.config.helperUrl }).userinfo({
     issuer: r.config.issuer,
     client_id: r.config.clientId,
     access_token: r.tokens.access_token,
