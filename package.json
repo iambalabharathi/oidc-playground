@@ -1,7 +1,7 @@
 {
   "name": "oidc-playground",
   "version": "0.1.0",
-  "description": "Static, stateless OpenID Connect playground (GitHub Pages): fill in provider + client, pick claims, authorize, inspect the ID token and UserInfo. Optional local helper for providers without CORS.",
+  "description": "Static OpenID Connect playground (GitHub Pages): build authorization requests by hand with scopes, claims, options and extra parameters. Optional code exchange in the browser or through a helper.",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,7 +9,6 @@
   },
   "scripts": {
     "start": "node -r dotenv/config server/index.js",
-    "mock-op": "node tools/mock-op.js",
     "cert": "sh tools/gen-cert.sh",
     "vendor": "cp node_modules/oauth4webapi/build/index.js docs/vendor/oauth4webapi.js && npx --yes esbuild@0.24.2 node_modules/jose/dist/webapi/index.js --bundle --format=esm --target=es2022 --outfile=docs/vendor/jose.js",
     "test": "node --test"

@@ -33,7 +33,7 @@ export const direct = {
       const result = await exchangeCode({
         as,
         clientId: body.client_id,
-        auth: { method: body.client_auth.method, clientSecret: body.client_auth.client_secret, privateKeyMaterial: body.client_auth.private_key },
+        auth: { method: body.client_auth.method, clientSecret: body.client_auth.client_secret, privateKeyMaterial: body.client_auth.private_key, assertionAudience: body.client_auth.assertion_audience },
         callbackUrl: body.callback_url,
         redirectUri: body.redirect_uri,
         expectedState: body.expected_state,

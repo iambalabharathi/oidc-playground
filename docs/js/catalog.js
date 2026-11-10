@@ -1,17 +1,13 @@
 // What can be requested: standard scopes and claims from OpenID Connect Core
-// §5.1/§5.4, plus the itsme®-specific claims (requested by their full URI).
+// §5.1/§5.4, plus any provider-specific scopes and claims typed in by the user.
 // Pure data + pure functions, so the same module is unit-tested in Node.
-
-export const ITSME_CLAIM_PREFIX = 'http://itsme.services/v2/claim/';
 
 export const SCOPES = [
   { id: 'openid', locked: true, hint: 'Required for an ID token' },
-  { id: 'service', dynamic: true, hint: 'itsme® service code' },
   { id: 'profile', hint: 'name, given_name, family_name, birthdate, gender, locale, picture, …' },
   { id: 'email', hint: 'email, email_verified' },
   { id: 'phone', hint: 'phone_number, phone_number_verified' },
   { id: 'address', hint: 'address (JSON object)' },
-  { id: 'eid', hint: 'itsme®: BENationalNumber, BEeidSn' },
   { id: 'offline_access', hint: 'Ask for a refresh token' },
 ];
 
@@ -32,72 +28,75 @@ export const CLAIM_GROUPS = [
     hint: 'scope: address · JSON object (formatted, street_address, locality, region, postal_code, country)',
     claims: std(['address']),
   },
-  {
-    id: 'itsme',
-    title: 'itsme® claims',
-    hint: `requested by full URI · ${ITSME_CLAIM_PREFIX}…`,
-    claims: [
-      ['be_nn', 'BENationalNumber'],
-      ['be_eid_sn', 'BEeidSn'],
-      ['pob', 'place_of_birth'],
-      ['citizenship', 'claim_citizenship'],
-      ['citizenship_iso', 'claim_citizenship_as_iso'],
-      ['device', 'claim_device'],
-      ['doc_type', 'IDDocumentType'],
-      ['doc_sn', 'IDDocumentSN'],
-      ['validity_to', 'validityTo'],
-      ['photo', 'physical_person_photo'],
-    ].map(([id, name]) => ({ id, key: ITSME_CLAIM_PREFIX + name, label: name, title: ITSME_CLAIM_PREFIX + name })),
-  },
 ];
 
-export const ALL_CLAIMS = CLAIM_GROUPS.flatMap((g) => g.claims);
-const CLAIM_BY_ID = new Map(ALL_CLAIMS.map((c) => [c.id, c]));
+export const STANDARD_CLAIMS = CLAIM_GROUPS.flatMap((g) => g.claims);
+const STANDARD_BY_KEY = new Map(STANDARD_CLAIMS.map((c) => [c.key, c]));
 
-export const ACR_PRESETS = [
-  { value: '', label: 'provider default' },
-  { value: `${ITSME_CLAIM_PREFIX}acr_basic`, label: 'acr_basic · PIN or biometrics' },
-  { value: `${ITSME_CLAIM_PREFIX}acr_advanced`, label: 'acr_advanced · PIN only' },
-];
+export const CUSTOM_CLAIM_ID_PREFIX = 'custom:';
 
-export const ISSUER_PRESETS = [
-  { id: 'itsme-e2e', label: 'itsme® sandbox (e2e)', issuer: 'https://idp.e2e.itsme.services/v2' },
-  { id: 'itsme-prd', label: 'itsme® production', issuer: 'https://idp.prd.itsme.services/v2' },
-  { id: 'mock', label: 'Local mock provider (npm run mock-op)', issuer: 'http://localhost:9000' },
-];
+/** A picker entry for a provider-specific claim (any name or URI). */
+export function customClaim(key) {
+  return { id: CUSTOM_CLAIM_ID_PREFIX + key, key, label: shortClaimName(key), title: key, custom: true };
+}
+
+/** Every claim the picker can show for this selection: the standard ones plus the custom ones added by the user. */
+export function allClaims(selection) {
+  return [...STANDARD_CLAIMS, ...(selection.customClaims || []).map(customClaim)];
+}
+
+/** Standard claim with this key, if there is one (lets "email" typed as a custom claim toggle the standard row). */
+export function standardClaimByKey(key) {
+  return STANDARD_BY_KEY.get(key);
+}
+
+/** Known issuers offered as presets ({ id, label, issuer, keyUrl? }); empty, so the issuer is typed in. */
+export const ISSUER_PRESETS = [];
 
 export const CLIENT_AUTH_METHODS = [
+  { id: 'private_key_jwt', label: 'private_key_jwt · signed client assertion (JWK)' },
   { id: 'client_secret_post', label: 'client_secret_post · secret in the token request body' },
   { id: 'client_secret_basic', label: 'client_secret_basic · HTTP Basic on the token endpoint' },
-  { id: 'private_key_jwt', label: 'private_key_jwt · signed client assertion (itsme recommended)' },
   { id: 'none', label: 'none · public client (PKCE only)' },
 ];
 
+/** Who the private_key_jwt client assertion is addressed to (its `aud` claim); providers differ. */
+export const ASSERTION_AUDIENCES = [
+  { id: 'token_endpoint', label: 'token endpoint URL · OpenID Connect Core §9' },
+  { id: 'issuer', label: 'issuer identifier · RFC 7523bis' },
+];
+
 export const DEFAULT_SELECTION = {
-  issuer: 'https://idp.e2e.itsme.services/v2',
+  issuer: '',
   clientId: '',
-  clientAuthMethod: 'client_secret_post',
-  serviceCode: '',
-  mode: 'direct', // direct (in the browser) | helper (local Node helper)
+  clientAuthMethod: 'private_key_jwt',
+  assertionAudience: 'token_endpoint', // aud of the client assertion: token_endpoint | issuer
+  redirectUri: '', // empty = this page; set when the client is registered with another redirect URI (the callback URL is then pasted back)
+  keyUrl: '', // where the private key (JWK, private JWKS or PEM) is fetched from; the key itself stays in sessionStorage
+  mode: 'request', // request (only build and open the request) | direct (exchange in the browser) | helper (exchange through a helper)
+  modeChosen: false, // true once the user picked the mode themselves
   helperUrl: 'http://localhost:3000',
-  scopes: { service: true, profile: true, email: true, phone: true },
+  scopes: { profile: true, email: true, phone: true },
+  extraScopes: '', // provider-specific scopes, space-separated, sent as typed
+  customClaims: [], // provider-specific claim names or URIs, requested through the claims parameter
   claims: {
     name: true, given_name: true, family_name: true, birthdate: true, gender: true, locale: true,
-    email: true, email_verified: true, phone_number: true, phone_number_verified: true, be_nn: true,
+    email: true, email_verified: true, phone_number: true, phone_number_verified: true,
   },
-  essential: { email: true, be_nn: true },
+  essential: { email: true },
   target: 'both', // userinfo | id_token | both
-  acr: `${ITSME_CLAIM_PREFIX}acr_basic`,
+  acr: '',
   prompt: '',
-  uiLocales: 'nl',
+  uiLocales: '',
   maxAge: '',
   loginHint: '',
+  extraParams: '', // any other request parameters, one key=value per line; they override a built-in parameter of the same name
   pkce: true,
 };
 
 /** Builds the OIDC `claims` request parameter from the picker state. */
 export function buildClaimsParameter(selection) {
-  const selected = ALL_CLAIMS.filter((c) => selection.claims[c.id]);
+  const selected = allClaims(selection).filter((c) => selection.claims[c.id]);
   if (!selected.length) return null;
   const entry = (c) => (selection.essential[c.id] ? { essential: true } : null);
   const out = {};
@@ -110,17 +109,39 @@ export function buildClaimsParameter(selection) {
   return out;
 }
 
-/** The scope list that goes on the wire, in catalog order. */
-export function buildScopeList(selection, serviceCode) {
-  return SCOPES.filter((s) => s.locked || selection.scopes[s.id])
-    .map((s) => (s.dynamic ? `service:${serviceCode || 'SERVICE_CODE'}` : s.id))
-    .filter((s) => !(s.startsWith('service:') && !serviceCode));
+/** Splits free-text scopes ("a b, c") into unique tokens. */
+export function parseExtraScopes(text) {
+  return [...new Set(String(text || '').split(/[\s,]+/).filter(Boolean))];
 }
 
-/** Everything POST /api/auth/start needs. */
-export function buildStartRequest(selection, serviceCode) {
+/** The scope list that goes on the wire: catalog order first, then the extra scopes as typed. */
+export function buildScopeList(selection) {
+  const list = SCOPES.filter((s) => s.locked || selection.scopes[s.id]).map((s) => s.id);
+  for (const s of parseExtraScopes(selection.extraScopes)) if (!list.includes(s)) list.push(s);
+  return list;
+}
+
+/**
+ * Free-text request parameters: one key=value per line (or separated by &), values as they
+ * should arrive at the provider (not URL-encoded). A later line with the same key wins.
+ */
+export function parseExtraParams(text) {
+  const out = new Map();
+  for (const part of String(text || '').split(/[\n&]+/)) {
+    const line = part.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    const key = (eq === -1 ? line : line.slice(0, eq)).trim();
+    if (!key) continue;
+    out.set(key, eq === -1 ? '' : line.slice(eq + 1).trim());
+  }
+  return [...out];
+}
+
+/** Everything the authorization request needs, before state/nonce/PKCE are generated. */
+export function buildStartRequest(selection) {
   const body = {
-    scopes: buildScopeList(selection, serviceCode),
+    scopes: buildScopeList(selection),
     claims: buildClaimsParameter(selection),
     pkce: !!selection.pkce,
   };
@@ -129,6 +150,8 @@ export function buildStartRequest(selection, serviceCode) {
   if (selection.uiLocales) body.ui_locales = selection.uiLocales;
   if (selection.maxAge !== '' && selection.maxAge !== null && selection.maxAge !== undefined) body.max_age = Number(selection.maxAge);
   if (selection.loginHint) body.login_hint = selection.loginHint;
+  const extra = parseExtraParams(selection.extraParams);
+  if (extra.length) body.extra = extra;
   return body;
 }
 
@@ -147,6 +170,12 @@ export function buildAuthorizationParams(body, { clientId, redirectUri, state, n
     if (body[k] !== undefined && body[k] !== null && body[k] !== '') params.push([k, String(body[k])]);
   }
   if (body.claims) params.push(['claims', JSON.stringify(body.claims)]);
+  // Extra parameters go last; one that names a built-in parameter replaces its value in place.
+  for (const [k, v] of body.extra || []) {
+    const existing = params.find((p) => p[0] === k);
+    if (existing) existing[1] = v;
+    else params.push([k, v]);
+  }
   return params;
 }
 
@@ -159,13 +188,11 @@ export function requestedClaimKeys(claimsParameter) {
   return [...keys];
 }
 
-export function claimById(id) {
-  return CLAIM_BY_ID.get(id);
-}
-
-/** Short display name for a claim key (strips the itsme URI prefix). */
+/** Short display name for a claim key: URI-style keys are shown by their last path segment. */
 export function shortClaimName(key) {
-  return key.startsWith(ITSME_CLAIM_PREFIX) ? `itsme:${key.slice(ITSME_CLAIM_PREFIX.length)}` : key;
+  if (!key.includes('/')) return key;
+  const last = key.replace(/\/+$/, '').split('/').pop();
+  return last ? `…/${last}` : key;
 }
 
 /** Human label for well-known claims; falls back to the short name. */
@@ -190,16 +217,6 @@ const LABELS = {
   phone_number: 'Phone',
   phone_number_verified: 'Phone verified',
   address: 'Address',
-  [ITSME_CLAIM_PREFIX + 'BENationalNumber']: 'National number',
-  [ITSME_CLAIM_PREFIX + 'BEeidSn']: 'eID card number',
-  [ITSME_CLAIM_PREFIX + 'place_of_birth']: 'Place of birth',
-  [ITSME_CLAIM_PREFIX + 'claim_citizenship']: 'Citizenship',
-  [ITSME_CLAIM_PREFIX + 'claim_citizenship_as_iso']: 'Citizenship (ISO)',
-  [ITSME_CLAIM_PREFIX + 'claim_device']: 'Device',
-  [ITSME_CLAIM_PREFIX + 'IDDocumentType']: 'ID document type',
-  [ITSME_CLAIM_PREFIX + 'IDDocumentSN']: 'ID document number',
-  [ITSME_CLAIM_PREFIX + 'validityTo']: 'Document valid until',
-  [ITSME_CLAIM_PREFIX + 'physical_person_photo']: 'Photo',
 };
 
 export function claimLabel(key) {

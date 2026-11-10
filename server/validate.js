@@ -70,6 +70,10 @@ export function validateClientAuth(value, errors) {
   if (method === 'private_key_jwt' && !out.private_key) {
     errors.push('client_auth.method=private_key_jwt needs client_auth.private_key');
   }
+  if (method === 'private_key_jwt') {
+    // aud of the client assertion: the token endpoint URL (default) or the issuer identifier
+    out.assertion_audience = input.assertion_audience === 'issuer' ? 'issuer' : 'token_endpoint';
+  }
   return out;
 }
 

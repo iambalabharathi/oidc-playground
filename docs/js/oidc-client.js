@@ -72,42 +72,64 @@ function summarize(as) {
 
 const PRIVATE_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth'];
 
-/** Accepts a private JWK (object or JSON), a JWKS with one private key, or a PEM (PKCS#8) key. */
+const isEncAlg = (alg) => typeof alg === 'string' && alg.startsWith('RSA-OAEP');
+const publicPart = (jwk) => Object.fromEntries(Object.entries(jwk).filter(([k]) => !PRIVATE_MEMBERS.includes(k) && k !== 'key_ops'));
+
+/**
+ * From a JWK or a JWKS, picks the private key that signs client assertions and the
+ * private RSA keys that decrypt responses. A JWKS may hold a "sig" and an "enc" key
+ * (and public keys, which are ignored); a single key does both when it is RSA.
+ */
+function selectPrivateJwks(parsed) {
+  const keys = (parsed && Array.isArray(parsed.keys) ? parsed.keys : [parsed]).filter((k) => k && typeof k === 'object');
+  const priv = keys.filter((k) => k.d);
+  const signing = priv.find((k) => k.use === 'sig')
+    || priv.find((k) => !k.use && !isEncAlg(k.alg))
+    || priv.find((k) => !isEncAlg(k.alg))
+    || priv[0];
+  let decryption = priv.filter((k) => k.kty === 'RSA' && (k.use === 'enc' || isEncAlg(k.alg)));
+  if (!decryption.length && signing?.kty === 'RSA') decryption = [signing];
+  return { signing, decryption, privateCount: priv.length, publicCount: keys.length - priv.length };
+}
+
+/** Accepts a private JWK (object or JSON), a JWKS with one or more private keys, or a PEM (PKCS#8) key. */
 export async function parsePrivateKey(material) {
-  let jwk;
+  let parsed;
   if (material && typeof material === 'object') {
-    jwk = material.keys ? material.keys.find((k) => k.d) : material;
+    parsed = material;
   } else {
     const text = String(material || '').trim();
     if (!text) throw new FlowError('invalid_private_key', 'No private key provided.', 'key');
     if (text.startsWith('{')) {
-      let parsed;
       try {
         parsed = JSON.parse(text);
       } catch {
         throw new FlowError('invalid_private_key', 'The private key is not valid JSON.', 'key');
       }
-      jwk = parsed.keys ? parsed.keys.find((k) => k.d) : parsed;
     } else if (text.includes('-----BEGIN')) {
-      jwk = await pemToJwk(text);
+      parsed = await pemToJwk(text);
     } else {
-      throw new FlowError('invalid_private_key', 'Paste the private key as a JWK (JSON) or as PEM.', 'key');
+      throw new FlowError('invalid_private_key', 'Provide the private key as a JWK / JWKS (JSON) or as PEM.', 'key');
     }
   }
-  if (!jwk || !jwk.d) throw new FlowError('invalid_private_key', 'The JWK does not contain a private key (no "d" member).', 'key');
+  const { signing: jwk, decryption, privateCount, publicCount } = selectPrivateJwks(parsed);
+  if (!jwk || !jwk.d) {
+    const why = publicCount && !privateCount ? 'No private key found: the JWKS only holds public keys (no "d" member) — point the page at the private JWKS, not the one you publish.' : 'The JWK does not contain a private key (no "d" member).';
+    throw new FlowError('invalid_private_key', why, 'key');
+  }
 
   const family = jwk.kty === 'EC' ? `EC:${jwk.crv}` : jwk.kty;
   const sigAlg = { RSA: 'RS256', 'EC:P-256': 'ES256', 'EC:P-384': 'ES384', 'EC:P-521': 'ES512' }[family];
   if (!sigAlg) throw new FlowError('invalid_private_key', `Unsupported key type ${family}; use an RSA or P-256/P-384/P-521 EC key.`, 'key');
 
-  const publicJwk = Object.fromEntries(Object.entries(jwk).filter(([k]) => !PRIVATE_MEMBERS.includes(k) && !['key_ops'].includes(k)));
+  const publicJwk = publicPart(jwk);
   let kid;
   try {
     kid = jwk.kid || (await jose.calculateJwkThumbprint(publicJwk));
   } catch (err) {
     throw new FlowError('invalid_private_key', `Invalid JWK: ${err.message}`, 'key');
   }
-  const alg = jwk.alg && !jwk.alg.startsWith('RSA-OAEP') ? jwk.alg : sigAlg;
+  const alg = jwk.alg && !isEncAlg(jwk.alg) ? jwk.alg : sigAlg;
 
   let signingKey;
   try {
@@ -117,9 +139,19 @@ export async function parsePrivateKey(material) {
   }
 
   const decryptionKeys = [];
-  if (jwk.kty === 'RSA') {
+  for (const encJwk of decryption) {
+    let encKid;
+    try {
+      encKid = encJwk.kid || (await jose.calculateJwkThumbprint(publicPart(encJwk)));
+    } catch (err) {
+      throw new FlowError('invalid_private_key', `Invalid encryption JWK: ${err.message}`, 'key');
+    }
     for (const encAlg of ['RSA-OAEP', 'RSA-OAEP-256']) {
-      decryptionKeys.push({ alg: encAlg, key: await jose.importJWK(stripAlg(jwk), encAlg) });
+      try {
+        decryptionKeys.push({ alg: encAlg, kid: encKid, key: await jose.importJWK(stripAlg(encJwk), encAlg) });
+      } catch (err) {
+        throw new FlowError('invalid_private_key', `The encryption key (kid ${encKid}) could not be imported: ${err.message}`, 'key');
+      }
     }
   }
 
@@ -131,6 +163,8 @@ export async function parsePrivateKey(material) {
     publicJwk: { ...publicJwk, kid, use: jwk.use || 'sig', alg },
     signingKey,
     decryptionKeys,
+    decryptionKids: [...new Set(decryptionKeys.map((k) => k.kid))],
+    keysFound: { private: privateCount, public: publicCount },
   };
 }
 
@@ -152,21 +186,27 @@ async function pemToJwk(pem) {
   throw new FlowError('invalid_private_key', `The PEM private key could not be read (PKCS#8 "BEGIN PRIVATE KEY" expected): ${lastError?.message || ''}`, 'key');
 }
 
-/** kid / alg / public JWK of a pasted private key — what the hosted JWKS must contain. */
+/** kid / alg / public JWK of the private key — what the hosted JWKS must contain — plus which keys decrypt. */
 export async function inspectKey(material) {
   const key = await parsePrivateKey(material);
-  return { kid: key.kid, alg: key.alg, kty: key.kty, public_jwk: key.publicJwk };
+  return { kid: key.kid, alg: key.alg, kty: key.kty, public_jwk: key.publicJwk, decryption_kids: key.decryptionKids, keys_found: key.keysFound };
 }
 
-async function clientAuthFor({ method, clientSecret, privateKey }) {
+async function clientAuthFor({ method, clientSecret, privateKey, assertionAudience }, as) {
   switch (method) {
     case 'client_secret_post':
       return oauth.ClientSecretPost(clientSecret);
     case 'client_secret_basic':
       return oauth.ClientSecretBasic(clientSecret);
-    case 'private_key_jwt':
+    case 'private_key_jwt': {
       if (!privateKey) throw new FlowError('invalid_private_key', 'private_key_jwt needs the private key.', 'token');
-      return oauth.PrivateKeyJwt({ key: privateKey.signingKey, kid: privateKey.kid });
+      // The library addresses the assertion to the issuer (RFC 7523bis); OpenID Connect Core §9 and many
+      // providers want the token endpoint URL instead, so the audience is the user's choice.
+      const aud = assertionAudience === 'issuer' ? as.issuer : as.token_endpoint;
+      return oauth.PrivateKeyJwt({ key: privateKey.signingKey, kid: privateKey.kid }, {
+        [oauth.modifyAssertion]: (header, payload) => { payload.aud = aud; },
+      });
+    }
     default:
       return oauth.None();
   }
@@ -175,12 +215,15 @@ async function clientAuthFor({ method, clientSecret, privateKey }) {
 function jweDecryptWith(privateKey) {
   return async (jwe) => {
     const header = jose.decodeProtectedHeader(jwe);
-    const candidate = privateKey?.decryptionKeys.find((k) => k.alg === header.alg) || privateKey?.decryptionKeys[0];
+    const keys = privateKey?.decryptionKeys || [];
+    const sameKid = header.kid ? keys.filter((k) => k.kid === header.kid) : [];
+    const pool = sameKid.length ? sameKid : keys;
+    const candidate = pool.find((k) => k.alg === header.alg) || pool[0];
     if (!candidate) {
-      throw new oauth.OperationProcessingError(`The response is encrypted (${header.alg}) but no RSA private key was pasted.`, { code: 'OAUTH_DECRYPTION_FAILED' });
+      throw new oauth.OperationProcessingError(`The response is encrypted (${header.alg}) but no RSA private key is loaded.`, { code: 'OAUTH_DECRYPTION_FAILED' });
     }
     const { plaintext } = await jose.compactDecrypt(jwe, candidate.key, { keyManagementAlgorithms: [header.alg] }).catch((cause) => {
-      throw new oauth.OperationProcessingError(`Decryption failed (${header.alg}${header.kid ? `, kid ${header.kid}` : ''}): check that the pasted key is the one the provider encrypts with.`, { cause, code: 'OAUTH_DECRYPTION_FAILED' });
+      throw new oauth.OperationProcessingError(`Decryption failed (${header.alg}${header.kid ? `, kid ${header.kid}` : ''}): check that the loaded key is the one the provider encrypts with (same kid as in your hosted JWKS).`, { cause, code: 'OAUTH_DECRYPTION_FAILED' });
     });
     return decoder.decode(plaintext);
   };
@@ -191,7 +234,7 @@ function jweDecryptWith(privateKey) {
 export async function exchangeCode({ as, clientId, auth, callbackUrl, redirectUri, expectedState, expectedNonce, codeVerifier, maxAge }) {
   const client = { client_id: clientId };
   const privateKey = auth.privateKeyMaterial ? await parsePrivateKey(auth.privateKeyMaterial) : null;
-  const clientAuth = await clientAuthFor({ ...auth, privateKey });
+  const clientAuth = await clientAuthFor({ ...auth, privateKey }, as);
   const insecure = insecureOption(as.issuer);
 
   const params = oauth.validateAuthResponse(as, client, new URL(callbackUrl), expectedState);
@@ -348,9 +391,14 @@ function networkError(err, url, stage) {
   if (err instanceof FlowError) return err;
   const inBrowser = typeof window !== 'undefined';
   const hint = inBrowser
-    ? ' The browser could not complete the request: either the provider does not allow cross-origin (CORS) requests from this page, or the URL is unreachable. Switch "Exchange through" to the local helper if the provider has no CORS support.'
+    ? ' The browser could not complete the request: either the provider does not allow cross-origin (CORS) requests from this page, or the URL is unreachable. Under Code exchange, switch to a helper if the provider has no CORS support.'
     : '';
   return new FlowError('network_error', `${err.message} while calling ${url}.${hint}`, stage, { cause: err });
+}
+
+/** The provider's error response body, when it is a JSON object, so the page can show it verbatim. */
+function plainBody(cause) {
+  return cause && typeof cause === 'object' && !(cause instanceof Error) ? cause : undefined;
 }
 
 /** Normalises oauth4webapi / jose / fetch errors into something the page can show. */
@@ -363,7 +411,7 @@ export function describeError(err, stage) {
     return { error: err.error, error_description: err.error_description || err.message, stage: 'authorization' };
   }
   if (err instanceof oauth.ResponseBodyError) {
-    return { error: err.error, error_description: err.error_description || err.message, stage, status: err.status };
+    return { error: err.error, error_description: err.error_description || err.message, stage, status: err.status, body: plainBody(err.cause) };
   }
   if (err instanceof oauth.WWWAuthenticateChallengeError) {
     const challenge = err.cause?.[0];

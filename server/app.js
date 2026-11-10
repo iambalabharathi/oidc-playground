@@ -20,7 +20,7 @@ export function createApp({ settings, oidc, log = console }) {
     res.set('Cache-Control', 'no-store');
     res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
     res.set('Vary', 'Origin');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
     res.set('Access-Control-Allow-Private-Network', 'true');
     res.set('Access-Control-Max-Age', '600');
@@ -41,10 +41,13 @@ export function createApp({ settings, oidc, log = console }) {
       res.json({ ok: true, ...result });
     } catch (err) {
       const described = describeError(err, stage);
-      log.warn(`[${stage}] ${described.error}: ${described.error_description}`);
+      log.warn(`[${stage}] ${described.error}: ${described.error_description}${described.body ? ` · provider response ${JSON.stringify(described.body)}` : ''}`);
       res.json({ ok: false, error: described });
     }
   };
+
+  // Lets the page find out that it is served by (or can reach) this helper.
+  app.get('/api/health', (req, res) => res.json({ ok: true, helper: 'oidc-playground' }));
 
   // Discovery document of the issuer typed in the page.
   app.post('/api/discover', handle(validateDiscoverRequest, async ({ issuer }) => ({ provider: await oidc.describeProvider(issuer) }), 'discovery'));

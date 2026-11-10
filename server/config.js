@@ -34,7 +34,7 @@ export function loadSettings(env = process.env) {
     tls: tls.keyFile ? tls : null,
     // Seconds a provider's discovery document is cached in memory (it is the only thing the server remembers).
     discoveryTtl: Number(env.DISCOVERY_CACHE_SECONDS || 300),
-    // http:// issuers are only allowed for loopback hosts unless this is set (handy for a mock on another box).
+    // http:// issuers are only allowed for loopback hosts unless this is set (handy for a test provider on another box).
     allowAnyInsecureIssuer: readFlag(env.ALLOW_INSECURE_ISSUER, false),
     trustProxy: readFlag(env.TRUST_PROXY, false),
   };

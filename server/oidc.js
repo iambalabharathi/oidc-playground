@@ -75,17 +75,23 @@ export function createOidc(settings, log = console) {
         clientMetadata.client_secret = clientAuth.client_secret;
         authentication = client.ClientSecretBasic(clientAuth.client_secret);
         break;
-      case 'private_key_jwt':
-        authentication = client.PrivateKeyJwt({ key: privateKey.signing.key, kid: privateKey.kid });
+      case 'private_key_jwt': {
+        // openid-client addresses the assertion to the issuer; OpenID Connect Core §9 and many providers
+        // expect the token endpoint URL, so the page chooses.
+        const aud = clientAuth.assertion_audience === 'issuer' ? metadata.issuer : metadata.token_endpoint;
+        authentication = client.PrivateKeyJwt({ key: privateKey.signing.key, kid: privateKey.kid }, {
+          [client.modifyAssertion]: (header, payload) => { payload.aud = aud; },
+        });
         break;
+      }
       default:
         authentication = client.None();
     }
     const configuration = new client.Configuration(metadata, clientId, clientMetadata, authentication);
     if (new URL(issuer).protocol === 'http:') client.allowInsecureRequests(configuration);
     if (privateKey && privateKey.decryption.length) {
-      // the provider encrypts with the key it finds in the hosted JWKS; its kid must match the pasted key's kid
-      client.enableDecryptingResponses(configuration, undefined, ...privateKey.decryption.map((k) => ({ key: k.key, alg: k.alg, kid: privateKey.kid })));
+      // the provider encrypts with the key it finds in the hosted JWKS; the kid must match one of our private keys
+      client.enableDecryptingResponses(configuration, undefined, ...privateKey.decryption.map((k) => ({ key: k.key, alg: k.alg, kid: k.kid })));
     }
     return configuration;
   }
@@ -183,7 +189,7 @@ export function createOidc(settings, log = console) {
 
   async function inspectKey(material) {
     const key = await importPrivateKey(material);
-    return { kid: key.kid, alg: key.alg, kty: key.kty, public_jwk: key.publicJwk };
+    return { kid: key.kid, alg: key.alg, kty: key.kty, public_jwk: key.publicJwk, decryption_kids: key.decryptionKids, keys_found: key.keysFound };
   }
 
   return { discover, describeProvider, exchangeCode, fetchUserinfo, inspectKey };
@@ -241,7 +247,8 @@ export function describeError(err, stage) {
     return { ...base, stage: 'authorization', error: err.error, error_description: err.error_description || err.message };
   }
   if (err instanceof client.ResponseBodyError) {
-    return { ...base, error: err.error, error_description: err.error_description || err.message, status: err.status };
+    const body = err.cause && typeof err.cause === 'object' && !(err.cause instanceof Error) ? err.cause : undefined;
+    return { ...base, error: err.error, error_description: err.error_description || err.message, status: err.status, body };
   }
   if (err instanceof client.WWWAuthenticateChallengeError) {
     const challenge = err.cause?.[0];

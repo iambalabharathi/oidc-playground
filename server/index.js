@@ -35,7 +35,7 @@ function main() {
   server.listen(settings.port, settings.host, () => {
     const scheme = settings.tls ? 'https' : 'http';
     console.log(`OIDC playground  →  ${scheme}://localhost:${settings.port}/`);
-    console.log(`  redirect URI   ${scheme}://localhost:${settings.port}/   (the page itself; register it at the provider)`);
+    console.log(`  redirect URI   ${scheme}://localhost:${settings.port}/   (default: the page itself; the form accepts another registered one)`);
     console.log(`  helper API     ${scheme}://localhost:${settings.port}/api  (for providers without CORS)`);
     console.log('  state          none kept server-side');
   });

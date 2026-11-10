@@ -1,5 +1,5 @@
 #!/bin/sh
-# Self-signed certificate for https://localhost:8443 (itsme only accepts https redirect URIs).
+# Self-signed certificate for https://localhost:8443 (for providers that only accept https redirect URIs).
 # Your browser will warn once; accept it for localhost.
 set -eu
 cd "$(dirname "$0")/.."

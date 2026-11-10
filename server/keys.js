@@ -1,6 +1,7 @@
-// Turns a private JWK pasted into the page into the CryptoKeys openid-client
-// needs: one to sign private_key_jwt client assertions, and (for RSA keys) the
-// RSA-OAEP variants that decrypt encrypted ID tokens / UserInfo responses.
+// Turns the private key material the page sends (a JWK, a JWKS with private keys,
+// or PEM) into the CryptoKeys openid-client needs: one to sign private_key_jwt
+// client assertions, and the RSA-OAEP variants that decrypt encrypted ID tokens /
+// UserInfo responses. A JWKS may hold a separate "sig" and "enc" key.
 // The public half is derived so the page can show what the hosted JWKS must contain.
 import { createPrivateKey, createPublicKey, webcrypto } from 'node:crypto';
 import { calculateJwkThumbprint } from 'jose';
@@ -14,28 +15,24 @@ const SIGNING_ALGS = {
 
 export class KeyError extends Error {}
 
+const isEncAlg = (alg) => typeof alg === 'string' && alg.startsWith('RSA-OAEP');
+
 function stripJwkMetadata(jwk) {
   const { alg, use, key_ops, kid, x5c, x5t, 'x5t#S256': x5tS256, x5u, ...rest } = jwk;
   return rest;
 }
 
-/** Accepts a JWK object, a JWK JSON string, a JWKS with one private key, or a PEM private key. */
+/** Parses the material into a JWK or JWKS object (PEM becomes a single private JWK). */
 export function parsePrivateKeyMaterial(material) {
-  if (material && typeof material === 'object') {
-    const jwk = material.keys ? material.keys.find((k) => k.d) : material;
-    if (!jwk || !jwk.d) throw new KeyError('The JWK does not contain a private key (no "d" member)');
-    return jwk;
-  }
+  if (material && typeof material === 'object') return material;
   const text = String(material || '').trim();
   if (!text) throw new KeyError('No private key provided');
   if (text.startsWith('{')) {
-    let parsed;
     try {
-      parsed = JSON.parse(text);
+      return JSON.parse(text);
     } catch {
       throw new KeyError('The private key is not valid JSON');
     }
-    return parsePrivateKeyMaterial(parsed);
   }
   if (text.includes('-----BEGIN')) {
     try {
@@ -44,22 +41,44 @@ export function parsePrivateKeyMaterial(material) {
       throw new KeyError(`The PEM private key could not be read: ${err.message}`);
     }
   }
-  throw new KeyError('Paste the private key as a JWK (JSON) or as PEM');
+  throw new KeyError('Provide the private key as a JWK / JWKS (JSON) or as PEM');
+}
+
+/** Picks the signing key and the decrypting RSA keys out of a JWK or JWKS; public keys are ignored. */
+export function selectPrivateJwks(parsed) {
+  const keys = (parsed && Array.isArray(parsed.keys) ? parsed.keys : [parsed]).filter((k) => k && typeof k === 'object');
+  const priv = keys.filter((k) => k.d);
+  const signing = priv.find((k) => k.use === 'sig')
+    || priv.find((k) => !k.use && !isEncAlg(k.alg))
+    || priv.find((k) => !isEncAlg(k.alg))
+    || priv[0];
+  let decryption = priv.filter((k) => k.kty === 'RSA' && (k.use === 'enc' || isEncAlg(k.alg)));
+  if (!decryption.length && signing?.kty === 'RSA') decryption = [signing];
+  if (!signing || !signing.d) {
+    throw new KeyError(keys.length && !priv.length
+      ? 'No private key found: the JWKS only holds public keys (no "d" member) — send the private JWKS, not the published one'
+      : 'The JWK does not contain a private key (no "d" member)');
+  }
+  return { signing, decryption, privateCount: priv.length, publicCount: keys.length - priv.length };
+}
+
+async function kidOf(jwk) {
+  try {
+    return jwk.kid || (await calculateJwkThumbprint(stripJwkMetadata(jwk)));
+  } catch (err) {
+    throw new KeyError(`Invalid JWK: ${err.message}`);
+  }
 }
 
 export async function importPrivateKey(material) {
-  const privateJwk = parsePrivateKeyMaterial(material);
+  const { signing: privateJwk, decryption: encJwks, privateCount, publicCount } = selectPrivateJwks(parsePrivateKeyMaterial(material));
   const bare = stripJwkMetadata(privateJwk);
   const family = bare.kty === 'EC' ? `EC:${bare.crv}` : bare.kty;
   const signing = SIGNING_ALGS[family];
   if (!signing) throw new KeyError(`Unsupported key type ${family}; use an RSA or P-256/P-384/P-521 EC key`);
 
-  let kid;
-  try {
-    kid = privateJwk.kid || (await calculateJwkThumbprint(bare));
-  } catch (err) {
-    throw new KeyError(`Invalid JWK: ${err.message}`);
-  }
+  const kid = await kidOf(privateJwk);
+  const alg = privateJwk.alg && !isEncAlg(privateJwk.alg) ? privateJwk.alg : signing.alg;
 
   let signingKey;
   try {
@@ -69,12 +88,15 @@ export async function importPrivateKey(material) {
   }
 
   const decryption = [];
-  if (bare.kty === 'RSA') {
-    for (const [alg, hash] of [['RSA-OAEP', 'SHA-1'], ['RSA-OAEP-256', 'SHA-256']]) {
-      decryption.push({
-        alg,
-        key: await webcrypto.subtle.importKey('jwk', bare, { name: 'RSA-OAEP', hash }, false, ['decrypt']),
-      });
+  for (const encJwk of encJwks) {
+    const encKid = await kidOf(encJwk);
+    const encBare = stripJwkMetadata(encJwk);
+    for (const [encAlg, hash] of [['RSA-OAEP', 'SHA-1'], ['RSA-OAEP-256', 'SHA-256']]) {
+      try {
+        decryption.push({ alg: encAlg, kid: encKid, key: await webcrypto.subtle.importKey('jwk', encBare, { name: 'RSA-OAEP', hash }, false, ['decrypt']) });
+      } catch (err) {
+        throw new KeyError(`The encryption key (kid ${encKid}) could not be imported: ${err.message}`);
+      }
     }
   }
 
@@ -82,10 +104,12 @@ export async function importPrivateKey(material) {
 
   return {
     kid,
-    alg: privateJwk.alg || signing.alg,
+    alg,
     kty: bare.kty,
     signing: { key: signingKey, kid },
     decryption,
-    publicJwk: { ...publicJwk, kid, use: privateJwk.use || 'sig', alg: privateJwk.alg || signing.alg },
+    decryptionKids: [...new Set(decryption.map((k) => k.kid))],
+    keysFound: { private: privateCount, public: publicCount },
+    publicJwk: { ...publicJwk, kid, use: privateJwk.use || 'sig', alg },
   };
 }

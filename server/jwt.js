@@ -58,7 +58,9 @@ export async function parseUserinfoBody({ contentType, body, issuer, clientId, j
 
     if (token.split('.').length === 5) {
       format = 'jwe';
-      const candidate = decryptionKeys.find((k) => k.alg === protectedHeader.alg) || decryptionKeys[0];
+      const sameKid = protectedHeader.kid ? decryptionKeys.filter((k) => k.kid === protectedHeader.kid) : [];
+      const pool = sameKid.length ? sameKid : decryptionKeys;
+      const candidate = pool.find((k) => k.alg === protectedHeader.alg) || pool[0];
       if (!candidate) {
         throw new Error(`UserInfo response is encrypted (${protectedHeader.alg}) but no private key is configured. Set PRIVATE_KEY_FILE and DECRYPT_RESPONSES=1.`);
       }
